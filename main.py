@@ -1,1330 +1,1295 @@
-import telebot
-import subprocess
-import os
-import zipfile
-import tempfile
-import shutil
-from telebot import types
-import time
-from datetime import datetime, timedelta
-import psutil
-import sqlite3
-import json
 import logging
-import threading
-import re
+import os
 import sys
-import uuid
-import atexit
-import requests
-import io
+import asyncio
+import re
+import httpx
+import hashlib
+import json
+import csv
+import html
+from io import StringIO, BytesIO
+from datetime import datetime, timedelta
+import threading
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    ApplicationBuilder, 
+    CommandHandler, 
+    MessageHandler, 
+    filters, 
+    ContextTypes, 
+    CallbackQueryHandler
+)
+from telegram.error import BadRequest, Conflict, TimedOut, TelegramError, Forbidden
 
-# --- Flask Keep Alive ---
-from flask import Flask
+# =========================================================================
+# --- WINDOWS TERMINAL UNICODE FIX & ADVANCED LOGGING ---
+# =========================================================================
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "I'm Marco File Host"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = threading.Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-    print("Flask Keep-Alive started.")
-
-
-_p1 = "8958211506"
-_p2 = ":"
-_p3 = "AAFpKSdeQNqY"
-_p4 = "JCl4Q1nVWXMWnberNcLNPb4"
-TOKEN = f"{_p1}{_p2}{_p3}{_p4}"
-
-OWNER_ID = 6138186135
-ADMIN_ID = 6138186135
-
-YOUR_USERNAME = '@rafian40'
-UPDATE_CHANNEL = 'https://t.me/rafian40'
-
-# ২ টি বাধ্যতামূলক চ্যানেল (বটকে অবশ্যই চ্যানেল দুটিতে অ্যাডমিন রাখতে হবে)
-REQUIRED_CHANNELS = [
-    {"username": "@customsmsfree", "url": "https://t.me/customsmsfree", "name": "Custom SMS Free"},
-    {"username": "@free_income_13", "url": "https://t.me/free_income_13", "name": "Free Income 13"}
-]
-
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
-IROTECH_DIR = os.path.join(BASE_DIR, 'inf')
-DATABASE_PATH = os.path.join(IROTECH_DIR, 'bot_data.db')
-
-FREE_USER_LIMIT = 3
-SUBSCRIBED_USER_LIMIT = 15
-ADMIN_LIMIT = 99999
-OWNER_LIMIT = float('inf')
-
-os.makedirs(UPLOAD_BOTS_DIR, exist_ok=True)
-os.makedirs(IROTECH_DIR, exist_ok=True)
-
-bot = telebot.TeleBot(TOKEN)
-
-# --- Data ---
-bot_scripts = {}
-user_subscriptions = {}
-user_files = {}
-active_users = set()
-admin_ids = {ADMIN_ID, OWNER_ID}
-bot_locked = False
-pending_approvals = {}
-
-# --- Logging ---
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot_core_debug.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# --- Premium Emojis ---
-PEM = {
-    "ok": '<tg-emoji emoji-id="6111726981760423576">✅</tg-emoji>',
-    "no": '<tg-emoji emoji-id="6311965254817423602">❌</tg-emoji>',
-    "warn": '<tg-emoji emoji-id="6314510813214284503">⚠️</tg-emoji>',
-    "admin": '<tg-emoji emoji-id="5353032893096567467">📊</tg-emoji>',
-    "user": '<tg-emoji emoji-id="5352861489541714456">👤</tg-emoji>',
-    "money": '<tg-emoji emoji-id="6111799373434197692">💸</tg-emoji>',
-    "msg": '<tg-emoji emoji-id="5337302974806922068">💬</tg-emoji>',
-    "rocket": '<tg-emoji emoji-id="5352597830089347330">🚀</tg-emoji>',
-    "pin": '<tg-emoji emoji-id="6111410240807245099">📌</tg-emoji>',
-    "hi": '<tg-emoji emoji-id="5353027129250453493">👋</tg-emoji>',
-    "add": '<tg-emoji emoji-id="6188038822509418008">➕</tg-emoji>',
-    "rem": '<tg-emoji emoji-id="6188343249791358585">➖</tg-emoji>',
-    "view": '<tg-emoji emoji-id="6188447235244562676">👀</tg-emoji>',
-    "wait": '<tg-emoji emoji-id="6233136657722251031">⏳</tg-emoji>',
-    "bell": '<tg-emoji emoji-id="6260082445018731350">🔔</tg-emoji>',
-    "crown": '<tg-emoji emoji-id="6183661284467152997">👑</tg-emoji>',
-    "gear": '<tg-emoji emoji-id="6260111633616475361">⚙️</tg-emoji>',
-    "check": '<tg-emoji emoji-id="6188038822509418008">✅</tg-emoji>',
-    "file": '<tg-emoji emoji-id="5352721946054268944">📁</tg-emoji>',
-    "key": '<tg-emoji emoji-id="6233302765582424442">🔑</tg-emoji>',
-    "join": '<tg-emoji emoji-id="5352597830089347330">➡️</tg-emoji>',
-    "gift": '<tg-emoji emoji-id="6111799373434197692">🎁</tg-emoji>'
-}
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
-# --- Force Join Logic ---
-def check_user_joined(user_id):
-    if user_id in admin_ids or user_id == OWNER_ID:
-        return True
-    for ch in REQUIRED_CHANNELS:
+# =========================================================================
+# --- LOCAL JSON DATABASE CONFIGURATION ---
+# =========================================================================
+DB_FILE = "local_database.json"
+
+def load_local_db():
+    if os.path.exists(DB_FILE):
         try:
-            member = bot.get_chat_member(ch["username"], user_id)
-            if member.status in ['left', 'kicked']:
-                return False
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception as e:
-            logger.warning(f"Error checking membership for {ch['username']}: {e}")
-            return False
-    return True
-
-def send_force_join_prompt(chat_id):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for ch in REQUIRED_CHANNELS:
-        markup.add(types.InlineKeyboardButton(f"📢 Join {ch['name']}", url=ch["url"]))
-    markup.add(types.InlineKeyboardButton("🔄 Verify / Joined", callback_data="check_join_status"))
-    
-    text = (
-        f"{PEM['warn']} <b>বটটি ব্যবহার করতে আপনাকে অবশ্যই নিচের চ্যানেল দুটিতে জয়েন হতে হবে!</b>\n\n"
-        f"১. <a href='https://t.me/customsmsfree'>Custom SMS Free</a>\n"
-        f"২. <a href='https://t.me/free_income_13'>Free Income 13</a>\n\n"
-        f"জয়েন সম্পন্ন হলে নিচের <b>'Verify / Joined'</b> বাটনে ক্লিক করুন:"
-    )
-    bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=markup, disable_web_page_preview=True)
-
-# --- RAW API for sending reply keyboard with premium emoji ---
-def raw_send(chat_id, text, reply_keyboard=None, parse_mode="HTML"):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True
+            logger.error(f"Error loading local DB: {e}")
+    return {
+        "users": {},
+        "assignments": {},
+        "withdrawals": {},
+        "settings": {
+            'otp_rate': '1.0',
+            'min_withdraw': '1000',
+            'global_cc_limit': '3'
+        },
+        "country_rates": {},
+        "country_limits": {},
+        "processed_messages": {}
     }
-    if reply_keyboard:
-        payload["reply_markup"] = {
-            "keyboard": reply_keyboard,
-            "resize_keyboard": True
+
+def save_local_db():
+    try:
+        data = {
+            "users": CACHE_USERS,
+            "assignments": CACHE_ASSIGNMENTS,
+            "withdrawals": CACHE_WITHDRAWALS,
+            "settings": CACHE_SETTINGS,
+            "country_rates": CACHE_RATES,
+            "country_limits": CACHE_LIMITS,
+            "processed_messages": CACHE_PROCESSED
         }
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                          json=payload, timeout=60)
-        return r.json()
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        logger.error(f"raw_send err: {e}")
-        return {}
+        logger.error(f"Error saving local DB: {e}")
 
-def raw_answer_cb(cb_id, text="", alert=False):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery",
-                      json={"callback_query_id": cb_id, "text": text, "show_alert": alert},
-                      timeout=30)
-    except: pass
+db_data = load_local_db()
 
-def rbtn(text, emoji_id=None, style=None):
-    b = {"text": text}
-    if emoji_id: b["icon_custom_emoji_id"] = emoji_id
-    if style: b["style"] = style
-    return b
+CACHE_USERS = db_data.get("users", {})
+CACHE_STOCK = {}
+CACHE_ASSIGNMENTS = db_data.get("assignments", {})
+CACHE_SETTINGS = db_data.get("settings", {})
+CACHE_RATES = db_data.get("country_rates", {})
+CACHE_LIMITS = db_data.get("country_limits", {})
+CACHE_PROCESSED = db_data.get("processed_messages", {})
+CACHE_WITHDRAWALS = db_data.get("withdrawals", {})
 
-# --- Main Reply Keyboards ---
-def get_main_kb(user_id):
-    if user_id in admin_ids:
-        return [
-            [rbtn("Updates Channel", "5352597830089347330", "primary")],
-            [rbtn("Upload File", "5352721946054268944", "primary"),
-             rbtn("Check Files", "6188447235244562676", "primary")],
-            [rbtn("Bot Speed", "6186175669991379791", "primary"),
-             rbtn("Statistics", "5353032893096567467", "success")],
-            [rbtn("Subscriptions", "6111799373434197692", "primary"),
-             rbtn("Broadcast", "5337302974806922068", "success")],
-            [rbtn("Lock Bot", "6311965254817423602", "danger"),
-             rbtn("Running All Code", "5352597830089347330", "success")],
-            [rbtn("Admin Panel", "6183661284467152997", "primary"),
-             rbtn("Contact Owner", "5337302974806922068", "primary")]
-        ]
-    else:
-        return [
-            [rbtn("Updates Channel", "5352597830089347330", "primary")],
-            [rbtn("Upload File", "5352721946054268944", "primary"),
-             rbtn("Check Files", "6188447235244562676", "primary")],
-            [rbtn("Bot Speed", "6186175669991379791", "primary"),
-             rbtn("Statistics", "5353032893096567467", "success")],
-            [rbtn("Contact Owner", "5337302974806922068", "primary")]
-        ]
+otp_process_lock = asyncio.Lock()
 
-# --- DB ---
-def init_db():
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('CREATE TABLE IF NOT EXISTS subscriptions (user_id INTEGER PRIMARY KEY, expiry TEXT)')
-        c.execute('CREATE TABLE IF NOT EXISTS user_files (user_id INTEGER, file_name TEXT, file_type TEXT, PRIMARY KEY (user_id, file_name))')
-        c.execute('CREATE TABLE IF NOT EXISTS active_users (user_id INTEGER PRIMARY KEY)')
-        c.execute('CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)')
-        c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
-        if ADMIN_ID != OWNER_ID:
-            c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
-        conn.commit(); conn.close()
-        logger.info("DB OK.")
-    except Exception as e:
-        logger.error(f"DB err: {e}")
+# =========================================================================
+# --- BOT CONFIGURATION & GLOBAL SETTINGS ---
+# =========================================================================
+ADMIN_IDS = [6138186135]
+SUPER_ADMIN_ID = 6138186135 
+TOKEN = "8883727725:AAE9vx2W4Zw6c3TySOB-HrfwD2tpbHbGwyU" 
+TARGET_GROUP_IDS = [-1004375045490] 
+OTP_GROUP_LINK = "https://t.me/your_otp_group" 
 
-def load_data():
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('SELECT user_id, expiry FROM subscriptions')
-        for u, e in c.fetchall():
-            try: user_subscriptions[u] = {'expiry': datetime.fromisoformat(e)}
-            except: pass
-        c.execute('SELECT user_id, file_name, file_type FROM user_files')
-        for u, fn, ft in c.fetchall():
-            user_files.setdefault(u, []).append((fn, ft))
-        c.execute('SELECT user_id FROM active_users')
-        active_users.update(x for (x,) in c.fetchall())
-        c.execute('SELECT user_id FROM admins')
-        admin_ids.update(x for (x,) in c.fetchall())
-        conn.close()
-        logger.info(f"Loaded: {len(active_users)} users")
-    except Exception as e:
-        logger.error(f"Load err: {e}")
+API_SOURCES = [
 
-init_db()
-load_data()
+    {
+        "name": "Lamix", 
+        "token": "37enC3fZIZ9NAztnIC7VeE_Q57ELIGVWamav3znVavA", 
+        "url": "https://panel.lamix.org/api/v1/messages"
+    },
+ 
+]
 
-# --- Helpers ---
-def get_user_folder(uid):
-    f = os.path.join(UPLOAD_BOTS_DIR, str(uid))
-    os.makedirs(f, exist_ok=True)
-    return f
+processed_ids = set()
 
-def get_user_file_limit(uid):
-    if uid == OWNER_ID: return OWNER_LIMIT
-    if uid in admin_ids: return ADMIN_LIMIT
-    if uid in user_subscriptions and user_subscriptions[uid]['expiry'] > datetime.now():
-        return SUBSCRIBED_USER_LIMIT
-    return FREE_USER_LIMIT
+http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(5.0, connect=2.0, read=4.0), 
+    limits=httpx.Limits(max_connections=500, max_keepalive_connections=100),
+    headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "application/json"
+    }
+)
 
-def get_user_file_count(uid):
-    return len(user_files.get(uid, []))
+def init_default_settings():
+    defaults = {
+        'otp_rate': '1.0',
+        'min_withdraw': '1000',
+        'global_cc_limit': '3'
+    }
+    for k, v in defaults.items():
+        if k not in CACHE_SETTINGS:
+            CACHE_SETTINGS[k] = v
+    for src in API_SOURCES:
+        key = f"api_status_{src['name']}"
+        if key not in CACHE_SETTINGS:
+            CACHE_SETTINGS[key] = '1'
+    save_local_db()
 
-def is_bot_running(owner, fn):
-    key = f"{owner}_{fn}"
-    info = bot_scripts.get(key)
-    if info and info.get('process'):
-        try:
-            p = psutil.Process(info['process'].pid)
-            r = p.is_running() and p.status() != psutil.STATUS_ZOMBIE
-            if not r:
-                if 'log_file' in info and hasattr(info['log_file'], 'close') and not info['log_file'].closed:
-                    try: info['log_file'].close()
-                    except: pass
-                bot_scripts.pop(key, None)
-            return r
-        except psutil.NoSuchProcess:
-            if 'log_file' in info and hasattr(info['log_file'], 'close') and not info['log_file'].closed:
-                try: info['log_file'].close()
-                except: pass
-            bot_scripts.pop(key, None)
-            return False
-        except: return False
-    return False
+init_default_settings()
 
-def kill_process_tree(info):
-    try:
-        if 'log_file' in info and hasattr(info['log_file'], 'close') and not info['log_file'].closed:
-            try: info['log_file'].close()
-            except: pass
-        p = info.get('process')
-        if p and hasattr(p, 'pid'):
-            pid = p.pid
-            if pid:
-                try:
-                    parent = psutil.Process(pid)
-                    children = parent.children(recursive=True)
-                    for ch in children:
-                        try: ch.terminate()
-                        except:
-                            try: ch.kill()
-                            except: pass
-                    gone, alive = psutil.wait_procs(children, timeout=1)
-                    for x in alive:
-                        try: x.kill()
-                        except: pass
-                    try:
-                        parent.terminate()
-                        try: parent.wait(timeout=1)
-                        except psutil.TimeoutExpired: parent.kill()
-                    except psutil.NoSuchProcess: pass
-                    except:
-                        try: parent.kill()
-                        except: pass
-                except psutil.NoSuchProcess: pass
-    except Exception as e:
-        logger.error(f"kill err: {e}")
+# =========================================================================
+# --- CORE UTILITY HELPERS ---
+# =========================================================================
+async def get_config_val(key, default):
+    return str(CACHE_SETTINGS.get(key, default))
 
-# --- Auto Install ---
-TELEGRAM_MODULES = {
-    'telebot': 'pyTelegramBotAPI', 'telegram': 'python-telegram-bot',
-    'aiogram': 'aiogram', 'pyrogram': 'pyrogram', 'telethon': 'telethon',
-    'requests': 'requests', 'bs4': 'beautifulsoup4', 'pillow': 'Pillow',
-    'cv2': 'opencv-python', 'yaml': 'PyYAML', 'dotenv': 'python-dotenv',
-    'pandas': 'pandas', 'numpy': 'numpy', 'flask': 'Flask',
-    'psutil': 'psutil', 'uuid': None, 'asyncio': None, 'json': None,
-    'datetime': None, 'os': None, 'sys': None, 're': None, 'time': None,
-    'math': None, 'random': None, 'logging': None, 'threading': None,
-    'subprocess': None, 'zipfile': None, 'tempfile': None, 'shutil': None,
-    'sqlite3': None, 'atexit': None
-}
+async def set_config_val(key, value):
+    val_str = str(value)
+    CACHE_SETTINGS[key] = val_str
+    save_local_db()
 
-def attempt_install_pip(mod, msg):
-    pkg = TELEGRAM_MODULES.get(mod.lower(), mod)
-    if pkg is None: return False
-    try:
-        bot.reply_to(msg, f"🐍 Installing `{pkg}`...", parse_mode='Markdown')
-        r = subprocess.run([sys.executable, '-m', 'pip', 'install', pkg],
-                           capture_output=True, text=True, check=False,
-                           encoding='utf-8', errors='ignore')
-        if r.returncode == 0:
-            bot.reply_to(msg, f"{PEM['ok']} Installed `{pkg}`.", parse_mode='HTML')
-            return True
-        else:
-            err = f"{PEM['no']} Failed.\n<pre>{r.stderr or r.stdout}</pre>"
-            if len(err) > 4000: err = err[:4000] + "\n..."
-            bot.reply_to(msg, err, parse_mode='HTML')
-            return False
-    except Exception as e:
-        bot.reply_to(msg, f"{PEM['no']} Error: {e}", parse_mode='HTML')
-        return False
+async def get_country_payout(country_name):
+    if country_name in CACHE_RATES:
+        return float(CACHE_RATES[country_name])
+    default_rate = await get_config_val('otp_rate', '1.0')
+    return float(default_rate)
 
-def attempt_install_npm(mod, folder, msg):
-    try:
-        bot.reply_to(msg, f"Installing npm `{mod}`...")
-        r = subprocess.run(['npm', 'install', mod], capture_output=True, text=True,
-                           check=False, cwd=folder, encoding='utf-8', errors='ignore')
-        if r.returncode == 0:
-            bot.reply_to(msg, f"{PEM['ok']} npm `{mod}` installed.", parse_mode='HTML')
-            return True
-        else:
-            err = f"{PEM['no']} npm failed.\n<pre>{r.stderr or r.stdout}</pre>"
-            if len(err) > 4000: err = err[:4000] + "\n..."
-            bot.reply_to(msg, err, parse_mode='HTML')
-            return False
-    except FileNotFoundError:
-        bot.reply_to(msg, f"{PEM['no']} 'npm' not found.", parse_mode='HTML')
-        return False
-    except Exception as e:
-        bot.reply_to(msg, f"{PEM['no']} Error: {e}", parse_mode='HTML')
-        return False
+async def get_country_cc_limit(country_name):
+    if country_name in CACHE_LIMITS:
+        return int(CACHE_LIMITS[country_name])
+    global_limit = await get_config_val('global_cc_limit', '3')
+    return int(global_limit)
 
-# --- Run Scripts ---
-def run_script(path, owner, folder, fn, msg_obj, attempt=1):
-    max_attempts = 2
-    if attempt > max_attempts:
-        bot.reply_to(msg_obj, f"{PEM['no']} Failed after {max_attempts} attempts.", parse_mode='HTML')
-        return
-    key = f"{owner}_{fn}"
-    try:
-        if not os.path.exists(path):
-            bot.reply_to(msg_obj, f"{PEM['no']} Script not found.", parse_mode='HTML')
-            if owner in user_files:
-                user_files[owner] = [f for f in user_files.get(owner, []) if f[0] != fn]
-            remove_user_file_db(owner, fn)
-            return
-        if attempt == 1:
-            cp = None
-            try:
-                cp = subprocess.Popen([sys.executable, path], cwd=folder,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, encoding='utf-8', errors='ignore')
-                out, err = cp.communicate(timeout=5)
-                rc = cp.returncode
-                if rc != 0 and err:
-                    m = re.search(r"ModuleNotFoundError: No module named '(.+?)'", err)
-                    if m:
-                        mod = m.group(1).strip().strip("'\"")
-                        if attempt_install_pip(mod, msg_obj):
-                            bot.reply_to(msg_obj, f"{PEM['wait']} Retrying...", parse_mode='HTML')
-                            time.sleep(2)
-                            threading.Thread(target=run_script, args=(path, owner, folder, fn, msg_obj, attempt+1)).start()
-                            return
-                        return
-                    else:
-                        bot.reply_to(msg_obj, f"{PEM['no']} Error:\n<pre>{err[:500]}</pre>", parse_mode='HTML')
-                        return
-            except subprocess.TimeoutExpired:
-                if cp and cp.poll() is None: cp.kill(); cp.communicate()
-            except FileNotFoundError:
-                bot.reply_to(msg_obj, f"{PEM['no']} Python not found.", parse_mode='HTML'); return
-            except Exception as e:
-                bot.reply_to(msg_obj, f"{PEM['no']} Error: {e}", parse_mode='HTML'); return
-            finally:
-                if cp and cp.poll() is None: cp.kill(); cp.communicate()
-        log_path = os.path.join(folder, f"{os.path.splitext(fn)[0]}.log")
-        lf = None; pr = None
-        try: lf = open(log_path, 'w', encoding='utf-8', errors='ignore')
-        except Exception as e:
-            bot.reply_to(msg_obj, f"{PEM['no']} Log open failed: {e}", parse_mode='HTML'); return
-        try:
-            si = None; cf = 0
-            if os.name == 'nt':
-                si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = subprocess.SW_HIDE
-            pr = subprocess.Popen([sys.executable, path], cwd=folder,
-                                  stdout=lf, stderr=lf, stdin=subprocess.PIPE,
-                                  startupinfo=si, creationflags=cf,
-                                  encoding='utf-8', errors='ignore')
-            bot_scripts[key] = {
-                'process': pr, 'log_file': lf, 'file_name': fn,
-                'chat_id': msg_obj.chat.id, 'script_owner_id': owner,
-                'start_time': datetime.now(), 'user_folder': folder,
-                'type': 'py', 'script_key': key
-            }
-            bot.reply_to(msg_obj, f"{PEM['ok']} Python script '{fn}' started! (PID: {pr.pid})", parse_mode='HTML')
-        except FileNotFoundError:
-            if lf and not lf.closed: lf.close()
-            bot.reply_to(msg_obj, f"{PEM['no']} Python not found.", parse_mode='HTML')
-            bot_scripts.pop(key, None)
-        except Exception as e:
-            if lf and not lf.closed: lf.close()
-            bot.reply_to(msg_obj, f"{PEM['no']} Error: {e}", parse_mode='HTML')
-            if pr and pr.poll() is None:
-                kill_process_tree({'process': pr, 'log_file': lf, 'script_key': key})
-            bot_scripts.pop(key, None)
-    except Exception as e:
-        bot.reply_to(msg_obj, f"{PEM['no']} Error: {e}", parse_mode='HTML')
-        if key in bot_scripts:
-            kill_process_tree(bot_scripts[key]); del bot_scripts[key]
+def normalize_num(num_str):
+    return re.sub(r'\D', '', str(num_str))
 
-def run_js_script(path, owner, folder, fn, msg_obj, attempt=1):
-    max_attempts = 2
-    if attempt > max_attempts:
-        bot.reply_to(msg_obj, f"{PEM['no']} Failed after {max_attempts} attempts.", parse_mode='HTML')
-        return
-    key = f"{owner}_{fn}"
-    try:
-        if not os.path.exists(path):
-            bot.reply_to(msg_obj, f"{PEM['no']} Script not found.", parse_mode='HTML')
-            if owner in user_files:
-                user_files[owner] = [f for f in user_files.get(owner, []) if f[0] != fn]
-            remove_user_file_db(owner, fn)
-            return
-        if attempt == 1:
-            cp = None
-            try:
-                cp = subprocess.Popen(['node', path], cwd=folder,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, encoding='utf-8', errors='ignore')
-                out, err = cp.communicate(timeout=5)
-                rc = cp.returncode
-                if rc != 0 and err:
-                    m = re.search(r"Cannot find module '(.+?)'", err)
-                    if m:
-                        mod = m.group(1).strip().strip("'\"")
-                        if not mod.startswith('.') and not mod.startswith('/'):
-                            if attempt_install_npm(mod, folder, msg_obj):
-                                bot.reply_to(msg_obj, f"{PEM['wait']} Retrying...", parse_mode='HTML')
-                                time.sleep(2)
-                                threading.Thread(target=run_js_script, args=(path, owner, folder, fn, msg_obj, attempt+1)).start()
-                                return
-                            return
-                    bot.reply_to(msg_obj, f"{PEM['no']} Error:\n<pre>{err[:500]}</pre>", parse_mode='HTML')
-                    return
-            except subprocess.TimeoutExpired:
-                if cp and cp.poll() is None: cp.kill(); cp.communicate()
-            except FileNotFoundError:
-                bot.reply_to(msg_obj, f"{PEM['no']} 'node' not found.", parse_mode='HTML'); return
-            except Exception as e:
-                bot.reply_to(msg_obj, f"{PEM['no']} Error: {e}", parse_mode='HTML'); return
-            finally:
-                if cp and cp.poll() is None: cp.kill(); cp.communicate()
-        log_path = os.path.join(folder, f"{os.path.splitext(fn)[0]}.log")
-        lf = None; pr = None
-        try: lf = open(log_path, 'w', encoding='utf-8', errors='ignore')
-        except Exception as e:
-            bot.reply_to(msg_obj, f"{PEM['no']} Log: {e}", parse_mode='HTML'); return
-        try:
-            si = None; cf = 0
-            if os.name == 'nt':
-                si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = subprocess.SW_HIDE
-            pr = subprocess.Popen(['node', path], cwd=folder,
-                                  stdout=lf, stderr=lf, stdin=subprocess.PIPE,
-                                  startupinfo=si, creationflags=cf,
-                                  encoding='utf-8', errors='ignore')
-            bot_scripts[key] = {
-                'process': pr, 'log_file': lf, 'file_name': fn,
-                'chat_id': msg_obj.chat.id, 'script_owner_id': owner,
-                'start_time': datetime.now(), 'user_folder': folder,
-                'type': 'js', 'script_key': key
-            }
-            bot.reply_to(msg_obj, f"{PEM['ok']} JS script '{fn}' started! (PID: {pr.pid})", parse_mode='HTML')
-        except FileNotFoundError:
-            if lf and not lf.closed: lf.close()
-            bot.reply_to(msg_obj, f"{PEM['no']} 'node' not found.", parse_mode='HTML')
-            bot_scripts.pop(key, None)
-        except Exception as e:
-            if lf and not lf.closed: lf.close()
-            bot.reply_to(msg_obj, f"{PEM['no']} Error: {e}", parse_mode='HTML')
-            if pr and pr.poll() is None:
-                kill_process_tree({'process': pr, 'log_file': lf, 'script_key': key})
-            bot_scripts.pop(key, None)
-    except Exception as e:
-        bot.reply_to(msg_obj, f"{PEM['no']} Error: {e}", parse_mode='HTML')
-        if key in bot_scripts:
-            kill_process_tree(bot_scripts[key]); del bot_scripts[key]
-
-# --- DB Ops ---
-DB_LOCK = threading.Lock()
-
-def save_user_file(uid, fn, ft='py'):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)', (uid, fn, ft))
-            conn.commit()
-            if uid not in user_files: user_files[uid] = []
-            user_files[uid] = [(n, t) for n, t in user_files[uid] if n != fn]
-            user_files[uid].append((fn, ft))
-        except Exception as e: logger.error(f"save_user_file: {e}")
-        finally: conn.close()
-
-def remove_user_file_db(uid, fn):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (uid, fn))
-            conn.commit()
-            if uid in user_files:
-                user_files[uid] = [f for f in user_files[uid] if f[0] != fn]
-                if not user_files[uid]: del user_files[uid]
-        except Exception as e: logger.error(f"remove_user_file: {e}")
-        finally: conn.close()
-
-def add_active_user(uid):
-    active_users.add(uid)
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR IGNORE INTO active_users (user_id) VALUES (?)', (uid,))
-            conn.commit()
-        except Exception as e: logger.error(f"add_active_user: {e}")
-        finally: conn.close()
-
-def save_subscription(uid, exp):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry) VALUES (?, ?)', (uid, exp.isoformat()))
-            conn.commit()
-            user_subscriptions[uid] = {'expiry': exp}
-        except Exception as e: logger.error(f"save_sub: {e}")
-        finally: conn.close()
-
-def remove_subscription_db(uid):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('DELETE FROM subscriptions WHERE user_id = ?', (uid,))
-            conn.commit()
-            user_subscriptions.pop(uid, None)
-        except Exception as e: logger.error(f"remove_sub: {e}")
-        finally: conn.close()
-
-def add_admin_db(uid):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (uid,))
-            conn.commit()
-            admin_ids.add(uid)
-        except Exception as e: logger.error(f"add_admin: {e}")
-        finally: conn.close()
-
-def remove_admin_db(uid):
-    if uid == OWNER_ID: return False
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        removed = False
-        try:
-            c.execute('DELETE FROM admins WHERE user_id = ?', (uid,))
-            conn.commit()
-            removed = c.rowcount > 0
-            if removed: admin_ids.discard(uid)
-            return removed
-        except Exception as e: logger.error(f"remove_admin: {e}"); return False
-        finally: conn.close()
-
-# --- Notifications & Sending File as TXT to Admin ---
-def notify_admin_new_file(aid, uid, uname, fname, fn, ft, is_zip=False, file_path=None):
-    txt = (
-        f"{PEM['bell']} <b>New File Upload — Approval Needed!</b>\n\n"
-        f"{PEM['user']} Name: <b>{fname}</b>\n"
-        f"{PEM['user']} Username: @{uname or 'N/A'}\n"
-        f"{PEM['user']} User ID: <code>{uid}</code>\n\n"
-        f"{PEM['file']} File: <code>{fn}</code>\n"
-        f"{PEM['gear']} Type: <b>{ft.upper()}</b>"
-        + (f"\n📦 (ZIP Archive)" if is_zip else "") +
-        f"\n\n{PEM['pin']} Approval ID: <code>{aid}</code>\n\n"
-        f"{PEM['wait']} Approve to run, or Reject to delete.\n\n"
-        f"👉 Send: <code>approve {aid}</code> or <code>reject {aid}</code>"
-    )
+def parse_otp_body(text):
+    if not text: return "Not found"
+    numeric_match = re.search(r'\b(\d{4,8})(?!\d)', text)
+    if numeric_match: 
+        return numeric_match.group(1)
+        
+    mixed_match = re.search(r'\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{4,10}\b', text)
+    if mixed_match:
+        val = mixed_match.group(0)
+        if not re.match(r'^\d+(st|nd|rd|th)$', val, re.IGNORECASE):
+            return val
+        
+    triggers = ['code', 'otp', 'is', 'pin', 'verification', 'verify', 'anyone']
+    STOP_WORDS = {
+        'with', 'anyone', 'to', 'for', 'your', 'my', 'this', 'is', 'a', 'an', 'the', 
+        'be', 'not', 'share', 'confirmation', 'verification', 'code', 'do', 'any', 
+        'one', 'about', 'from', 'me', 'us', 'him', 'her', 'them', 'by', 'at', 'on', 
+        'in', 'of', 'and', 'or', 'but', 'if', 'you', 'your', 'yours', 'yourself', 
+        'please', 'never', 'don', 'dont', 'should', 'would', 'could', 'will', 'shall',
+        'security', 'key', 'login', 'access'
+    }
     
-    admins_to_notify = set([int(ADMIN_ID)] + list(admin_ids))
-    for admin in admins_to_notify:
-        try:
-            raw_send(admin, txt)
-            if file_path and os.path.exists(file_path):
-                if is_zip:
-                    with open(file_path, 'rb') as f:
-                        bot.send_document(admin, f, caption=f"📦 Original ZIP Archive: {fn}\nFrom User: {uid}")
-                else:
-                    try:
-                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as code_f:
-                            code_data = code_f.read()
-                        txt_io = io.BytesIO(code_data.encode('utf-8'))
-                        txt_filename = f"{os.path.splitext(fn)[0]}_{ft}_code.txt"
-                        txt_io.name = txt_filename
-                        bot.send_document(
-                            admin,
-                            txt_io,
-                            caption=f"📄 Source Code (as .txt): <code>{fn}</code>\nUploaded by: <code>{uid}</code>",
-                            parse_mode='HTML'
-                        )
-                    except Exception as fe:
-                        logger.error(f"Error sending txt file: {fe}")
-        except Exception as e:
-            logger.error(f"notify admin {admin}: {e}")
+    lower_t = text.lower()
+    for t in triggers:
+        if t in lower_t:
+            idx = lower_t.find(t) + len(t)
+            rem = text[idx:].strip()
+            words = re.split(r'\s+', rem)
+            for w in words:
+                clean_w = re.sub(r'\W+', '', w)
+                if not clean_w: continue
+                if clean_w.lower() in STOP_WORDS: continue
+                if 4 <= len(clean_w) <= 12 and re.match(r'^[A-Za-z0-9]+$', clean_w):
+                    return clean_w
+                    
+    return "Not found"
 
-def notify_user_approved(uid, fn, ft):
+# =========================================================================
+# --- STYLED INTERFACE SYSTEM ---
+# =========================================================================
+def rich_btn(text, style=None, callback_data=None, url=None, copy_text=None):
+    btn = {"text": text}
+    if style: btn["style"] = style 
+    if callback_data: btn["callback_data"] = callback_data
+    if url: btn["url"] = url
+    if copy_text: btn["copy_text"] = {"text": copy_text}
+    return btn
+
+async def send_rich_message(bot, chat_id, text, keyboard_rows, parse_mode='HTML', **kwargs):
+    payload = {
+        "chat_id": chat_id, "text": text, "parse_mode": parse_mode,
+        "reply_markup": {"inline_keyboard": keyboard_rows}
+    }
+    payload.update(kwargs)
+    url = f"https://api.telegram.org/bot{bot.token}/sendMessage"
     try:
-        txt = (f"{PEM['ok']} <b>File Approved & Started!</b>\n\n"
-               f"{PEM['file']} File: <code>{fn}</code>\n"
-               f"{PEM['gear']} Type: {ft.upper()}\n\n"
-               f"{PEM['rocket']} Your file is now running!")
-        raw_send(uid, txt, reply_keyboard=get_main_kb(uid))
-    except Exception as e: logger.error(f"notify_user_approved: {e}")
+        resp = await http_client.post(url, json=payload)
+        return resp.json()
+    except Exception as e: logger.error(f"Dispatch failure: {e}")
 
-def notify_user_rejected(uid, fn, reason=""):
+async def edit_rich_message(bot, chat_id, message_id, text, keyboard_rows, parse_mode='HTML'):
+    payload = {
+        "chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode,
+        "reply_markup": {"inline_keyboard": keyboard_rows}
+    }
+    url = f"https://api.telegram.org/bot{bot.token}/editMessageText"
     try:
-        txt = (f"{PEM['no']} <b>File Rejected!</b>\n\n"
-               f"{PEM['file']} File: <code>{fn}</code>\n\n")
-        if reason: txt += f"{PEM['msg']} Reason: {reason}\n\n"
-        txt += f"{PEM['wait']} Contact support if needed."
-        raw_send(uid, txt, reply_keyboard=get_main_kb(uid))
-    except Exception as e: logger.error(f"notify_user_rejected: {e}")
+        resp = await http_client.post(url, json=payload)
+        return resp.json()
+    except Exception as e: logger.error(f"Edit failure: {e}")
 
-# --- File Handling ---
-def handle_zip(content, zname, message):
-    uid = message.from_user.id
-    folder = get_user_folder(uid)
-    tdir = None
+# =========================================================================
+# --- KEYBOARD LAYOUT ARCHITECTURE ---
+# =========================================================================
+def build_admin_main(uid):
+    kb = [
+        [KeyboardButton("📥 Number Upload"), KeyboardButton("🗑️ Number Delete")],
+        [KeyboardButton("👥 User List"), KeyboardButton("📊 Panel Stats")],
+        [KeyboardButton("💸 Withdraw Requests"), KeyboardButton("💰 Total Paid")],
+        [KeyboardButton("📢 Broadcast"), KeyboardButton("🧹 Clear All Stocks")],
+        [KeyboardButton("🚫 Ban User"), KeyboardButton("✅ Unban User")],
+        [KeyboardButton("⚙️ Set CC Limit"), KeyboardButton("✍️ Country Rate Set")]
+    ]
+    if uid == SUPER_ADMIN_ID:
+        kb.append([KeyboardButton("📤 Upload User Data")])
+    
+    kb.append([KeyboardButton("/start")])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def build_user_main():
+    kb = [
+        [KeyboardButton("⚡ Get Number 3"), KeyboardButton("🔥 Get Number 10")],
+        [KeyboardButton("💳 My Balance"), KeyboardButton("💵 Withdraw Funds")],
+        [KeyboardButton("🏆 Leaderboard"), KeyboardButton("📦 Stock History")],
+        [KeyboardButton("/start")]
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+# =========================================================================
+# --- ACCURATE USER STOCK ALLOCATION & ROUTING ENGINE ---
+# =========================================================================
+async def engine_assign_batch(user_id, country_name, count):
     try:
-        tdir = tempfile.mkdtemp(prefix=f"u_{uid}_zip_")
-        zp = os.path.join(tdir, zname)
-        with open(zp, 'wb') as f: f.write(content)
-        with zipfile.ZipFile(zp, 'r') as z:
-            for m in z.infolist():
-                mp = os.path.abspath(os.path.join(tdir, m.filename))
-                if not mp.startswith(os.path.abspath(tdir)):
-                    raise zipfile.BadZipFile(f"Unsafe: {m.filename}")
-            z.extractall(tdir)
-        items = os.listdir(tdir)
-        py_f = [f for f in items if f.endswith('.py')]
-        js_f = [f for f in items if f.endswith('.js')]
-        req = 'requirements.txt' if 'requirements.txt' in items else None
-        pkg = 'package.json' if 'package.json' in items else None
-        if req:
-            rp = os.path.join(tdir, req)
-            bot.reply_to(message, f"{PEM['wait']} Installing Python deps...", parse_mode='HTML')
-            try:
-                subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', rp],
-                               capture_output=True, text=True, check=True,
-                               encoding='utf-8', errors='ignore')
-                bot.reply_to(message, f"{PEM['ok']} Python deps installed.", parse_mode='HTML')
-            except subprocess.CalledProcessError as e:
-                err = f"{PEM['no']} Failed.\n<pre>{e.stderr or e.stdout}</pre>"
-                if len(err) > 4000: err = err[:4000] + "\n..."
-                bot.reply_to(message, err, parse_mode='HTML'); return
-        if pkg:
-            bot.reply_to(message, f"{PEM['wait']} Installing Node deps...", parse_mode='HTML')
-            try:
-                subprocess.run(['npm', 'install'], capture_output=True, text=True,
-                               check=True, cwd=tdir, encoding='utf-8', errors='ignore')
-                bot.reply_to(message, f"{PEM['ok']} Node deps installed.", parse_mode='HTML')
-            except FileNotFoundError:
-                bot.reply_to(message, f"{PEM['no']} 'npm' not found.", parse_mode='HTML'); return
-            except subprocess.CalledProcessError as e:
-                err = f"{PEM['no']} Failed.\n<pre>{e.stderr or e.stdout}</pre>"
-                if len(err) > 4000: err = err[:4000] + "\n..."
-                bot.reply_to(message, err, parse_mode='HTML'); return
-        main_s = None; ft = None
-        for p in ['main.py', 'bot.py', 'app.py']:
-            if p in py_f: main_s = p; ft = 'py'; break
-        if not main_s:
-            for p in ['index.js', 'main.js', 'bot.js', 'app.js']:
-                if p in js_f: main_s = p; ft = 'js'; break
-        if not main_s:
-            if py_f: main_s = py_f[0]; ft = 'py'
-            elif js_f: main_s = js_f[0]; ft = 'js'
-        if not main_s:
-            bot.reply_to(message, f"{PEM['no']} No .py or .js found!", parse_mode='HTML'); return
+        skip_limit = await get_country_cc_limit(country_name)
+        assigned_numbers = []
+        ts_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        permanent_zip = os.path.join(folder, zname)
-        with open(permanent_zip, 'wb') as f: f.write(content)
+        for batch_id, b_data in list(CACHE_STOCK.items()):
+            if isinstance(b_data, dict) and b_data.get("country") == country_name and b_data.get("numbers"):
+                nums = b_data.get("numbers", [])
+                if not nums: continue
+                
+                take_count = min(count - len(assigned_numbers), len(nums))
+                taken = nums[:take_count]
+                
+                b_data["numbers"] = nums[take_count:]
+                assigned_numbers.extend(taken)
+                
+                if len(assigned_numbers) >= count:
+                    break
 
-        for name in os.listdir(tdir):
-            src = os.path.join(tdir, name)
-            dst = os.path.join(folder, name)
-            if os.path.isdir(dst): shutil.rmtree(dst)
-            elif os.path.exists(dst): os.remove(dst)
-            shutil.move(src, dst)
-        save_user_file(uid, main_s, ft)
-        aid = str(uuid.uuid4())[:8].upper()
-        pending_approvals[aid] = {
-            'user_id': uid, 'file_name': main_s, 'file_type': ft,
-            'file_path': os.path.join(folder, main_s),
-            'user_folder': folder, 'message_info': message,
-            'is_zip': True, 'main_script': main_s, 'timestamp': time.time()
-        }
-        txt = (f"{PEM['ok']} <b>Files extracted & deps installed!</b>\n\n"
-               f"{PEM['wait']} Waiting for <b>Admin Approval</b>.\n"
-               f"{PEM['pin']} Approval ID: <code>{aid}</code>\n\n"
-               f"You will be notified once approved.")
-        raw_send(uid, txt, reply_keyboard=get_main_kb(uid))
-        notify_admin_new_file(aid, uid, message.from_user.username,
-                              message.from_user.first_name, main_s, ft, is_zip=True, file_path=permanent_zip)
-    except zipfile.BadZipFile as e:
-        bot.reply_to(message, f"{PEM['no']} Invalid ZIP: {e}", parse_mode='HTML')
+        if not assigned_numbers:
+            return None, "⚠️ Selected region stock empty!"
+
+        num_data_list = []
+        for num in assigned_numbers:
+            clean = normalize_num(num)
+            short_val = clean[skip_limit:] if len(clean) > skip_limit else clean
+            num_data_list.append({"full": clean, "short": short_val})
+            
+            assign_key = f"as_{clean}"
+            assign_item = {
+                'user_id': user_id,
+                'number': clean,
+                'country': country_name,
+                'assigned_at': ts_now,
+                'status': 'assigned'
+            }
+            CACHE_ASSIGNMENTS[assign_key] = assign_item
+
+        save_local_db()
+        header = f"📱 <b>Numbers Assigned for {country_name}:</b>"
+        return {"header": header, "numbers": num_data_list, "start_time": ts_now}, None
+
     except Exception as e:
-        logger.error(f"zip err: {e}", exc_info=True)
-        bot.reply_to(message, f"{PEM['no']} Error: {e}", parse_mode='HTML')
-    finally:
-        if tdir and os.path.exists(tdir):
-            try: shutil.rmtree(tdir)
+        logger.error(f"Assignment core failure: {e}")
+        return None, "💥 Allocation process fail!"
+
+async def engine_process_signal(application, record, silent=False):
+    async with otp_process_lock:
+        r_num = str(record.get('num', record.get('number', '')))
+        r_msg = record.get('message', record.get('content', ''))
+        if not r_num or not r_msg: return False
+        
+        n_clean = normalize_num(r_num)
+        m_hash = hashlib.md5(f"{n_clean}_{r_msg}".encode()).hexdigest()
+        
+        if m_hash in processed_ids:
+            return False
+
+        try:
+            matched_assign = None
+            
+            for as_key, as_data in CACHE_ASSIGNMENTS.items():
+                if isinstance(as_data, dict) and as_data.get('status') == 'assigned':
+                    as_num = normalize_num(as_data.get('number', ''))
+                    if as_num.endswith(n_clean[-8:]) if len(n_clean) >= 8 else as_num == n_clean:
+                        matched_assign = as_data
+                        break
+
+            if matched_assign:
+                u_id = matched_assign.get('user_id')
+                region = matched_assign.get('country', 'Global')
+                
+                u_data = CACHE_USERS.get(str(u_id), {}) if isinstance(CACHE_USERS.get(str(u_id)), dict) else {}
+                u_name = u_data.get('name', 'User')
+
+                u_msgs = CACHE_PROCESSED.get(str(u_id), {}) if isinstance(CACHE_PROCESSED.get(str(u_id)), dict) else {}
+                
+                if m_hash not in u_msgs:
+                    processed_ids.add(m_hash)
+                    payout = await get_country_payout(region)
+                    total = 0.0
+                    
+                    if not silent:
+                        curr_bal = float(u_data.get('balance', 0.0))
+                        curr_otp = int(u_data.get('otp_count', 0))
+                        total = curr_bal + payout
+                        
+                        up_u = {'balance': total, 'otp_count': curr_otp + 1}
+                        u_data.update(up_u)
+
+                        if str(u_id) not in CACHE_PROCESSED or not isinstance(CACHE_PROCESSED[str(u_id)], dict):
+                            CACHE_PROCESSED[str(u_id)] = {}
+                        
+                        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        CACHE_PROCESSED[str(u_id)][m_hash] = {'timestamp': now_str}
+                        save_local_db()
+
+                    otp_code = parse_otp_body(r_msg)
+                    escaped_body = html.escape(r_msg)
+                    
+                    body = (
+                        f"🎉 <b>OTP Received Successfully</b> 🎉\n\n"
+                        f"📱 <b>Number:</b> <code>{r_num}</code>\n"
+                        f"🔑 <b>OTP Code:</b> <code>{otp_code}</code>\n"
+                        f"💼 <b>Service:</b> <code>{record.get('cli','Unknown')}</code>\n"
+                        f"🌍 <b>Country:</b> <code>{region}</code>\n"
+                        f"✉️ <b>Message:</b> <code>{escaped_body}</code>\n\n"
+                        f"📡 <b>Source:</b> LIVE\n\n"
+                        f"👤 <b>User:</b> {u_name} ({u_id})"
+                    )
+
+                    kb = [[rich_btn("📋 Copy OTP", style="primary", copy_text=otp_code)]]
+
+                    for gid in TARGET_GROUP_IDS:
+                        try: await send_rich_message(application.bot, gid, body, kb)
+                        except Exception as e: logger.error(f"Group forward failed: {e}")
+                    
+                    if not silent:
+                        alert = body + f'\n\n💵 <b>Tk {payout:.2f}</b> added to your balance!\n💳 <b>Balance:</b> Tk {total:.2f}'
+                        try: await send_rich_message(application.bot, u_id, alert, kb)
+                        except Exception as e: logger.error(f"Private notify failed: {e}")
+                    return True
+            else:
+                if silent:
+                    processed_ids.add(m_hash)
+                    otp_code = parse_otp_body(r_msg)
+                    escaped_body = html.escape(r_msg)
+                    body = (
+                        f"🎉 <b>OTP Received Successfully</b> 🎉\n\n"
+                        f"📱 <b>Number:</b> <code>{r_num}</code>\n"
+                        f"🔑 <b>OTP Code:</b> <code>{otp_code}</code>\n"
+                        f"💼 <b>Service:</b> <code>{record.get('cli','Unknown')}</code>\n"
+                        f"✉️ <b>Message:</b> <code>{escaped_body}</code>\n\n"
+                        f"📡 <b>Source:</b> LIVE\n\n"
+                        f"👤 <b>User:</b> System Sync"
+                    )
+                    kb = [[rich_btn("Copy OTP", style="primary", copy_text=otp_code)]]
+                    for gid in TARGET_GROUP_IDS:
+                        try: await send_rich_message(application.bot, gid, body, kb)
+                        except: pass
+            return False
+        except Exception as e:
+            logger.error(f"Signal Routing Error: {e}")
+            return False
+
+# =========================================================================
+# --- ROUTING & HANDLERS ENGINE ---
+# =========================================================================
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user: return
+    uid, name = user.id, user.full_name
+    if user.username:
+        name = f"@{user.username}"
+    
+    if await check_is_restricted(uid):
+        await update.message.reply_text("🚫 <b>Access Restricted!</b> You are banned from using this bot.", parse_mode='HTML')
+        return
+    
+    u_str = str(uid)
+    if u_str not in CACHE_USERS or not isinstance(CACHE_USERS[u_str], dict):
+        u_obj = {
+            'name': name,
+            'balance': 0.0,
+            'otp_count': 0,
+            'status': 'active',
+            'joined_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        CACHE_USERS[u_str] = u_obj
+        save_local_db()
+    else:
+        CACHE_USERS[u_str]['name'] = name
+        save_local_db()
+
+    context.user_data['state'] = None
+    if uid in ADMIN_IDS:
+        await update.message.reply_text("👑 <b>Admin Authorization established.</b> Control board active!", reply_markup=build_admin_main(uid), parse_mode='HTML')
+    else:
+        await update.message.reply_text(f"👋 <b>Welcome {name}! Session established.</b>", reply_markup=build_user_main(), parse_mode='HTML')
+
+async def router_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    uid, data = query.from_user.id, query.data
+    if await check_is_restricted(uid): return
+
+    if data == "select_country_menu":
+        counts = {}
+        for b_id, b_val in CACHE_STOCK.items():
+            if isinstance(b_val, dict) and b_val.get('country'):
+                c = b_val.get('country')
+                cnt = len(b_val.get('numbers', []))
+                if cnt > 0:
+                    counts[c] = counts.get(c, 0) + cnt
+
+        if not counts: 
+            try: await query.answer("⚠️ Selected region stock depleted.", show_alert=True)
             except: pass
+        else:
+            btns = [[rich_btn(f"🌍 Region: {c} ({cnt})", "primary", f"alloc_{c}")] for c, cnt in counts.items()]
+            btns.append([rich_btn("🔙 Return", "danger", "exit_session")])
+            await edit_rich_message(context.bot, query.message.chat_id, query.message.message_id, "🌍 <b>Select Region Terminal:</b>", btns)
 
-def handle_js(path, uid, folder, fn, message):
-    try:
-        save_user_file(uid, fn, 'js')
-        aid = str(uuid.uuid4())[:8].upper()
-        pending_approvals[aid] = {
-            'user_id': uid, 'file_name': fn, 'file_type': 'js',
-            'file_path': path, 'user_folder': folder,
-            'message_info': message, 'is_zip': False,
-            'main_script': fn, 'timestamp': time.time()
-        }
-        txt = (f"{PEM['ok']} <b>JS file received!</b>\n\n"
-               f"{PEM['wait']} Waiting for <b>Admin Approval</b>.\n"
-               f"{PEM['pin']} Approval ID: <code>{aid}</code>")
-        raw_send(uid, txt, reply_keyboard=get_main_kb(uid))
-        notify_admin_new_file(aid, uid, message.from_user.username,
-                              message.from_user.first_name, fn, 'js', is_zip=False, file_path=path)
-    except Exception as e:
-        logger.error(f"js err: {e}", exc_info=True)
-        bot.reply_to(message, f"{PEM['no']} Error: {e}", parse_mode='HTML')
+    elif data.startswith("alloc_") or data == "change_num":
+        region = data.replace("alloc_", "") if data.startswith("alloc_") else context.user_data.get('l_c')
+        if not region: 
+            try: await query.answer("⚠️ Error. Region select করুন আবার।", show_alert=True)
+            except: pass
+            return
 
-def handle_py(path, uid, folder, fn, message):
-    try:
-        save_user_file(uid, fn, 'py')
-        aid = str(uuid.uuid4())[:8].upper()
-        pending_approvals[aid] = {
-            'user_id': uid, 'file_name': fn, 'file_type': 'py',
-            'file_path': path, 'user_folder': folder,
-            'message_info': message, 'is_zip': False,
-            'main_script': fn, 'timestamp': time.time()
-        }
-        txt = (f"{PEM['ok']} <b>Python file received!</b>\n\n"
-               f"{PEM['wait']} Waiting for <b>Admin Approval</b>.\n"
-               f"{PEM['pin']} Approval ID: <code>{aid}</code>")
-        raw_send(uid, txt, reply_keyboard=get_main_kb(uid))
-        notify_admin_new_file(aid, uid, message.from_user.username,
-                              message.from_user.first_name, fn, 'py', is_zip=False, file_path=path)
-    except Exception as e:
-        logger.error(f"py err: {e}", exc_info=True)
-        bot.reply_to(message, f"{PEM['no']} Error: {e}", parse_mode='HTML')
+        context.user_data['l_c'] = region
+        batch_size = context.user_data.get('p_count', 3)
+        res, err = await engine_assign_batch(uid, region, batch_size)
+        if err:
+            try: await query.answer(err, show_alert=True)
+            except: pass
+        else:
+            msg_numbers = ""
+            for n in res['numbers']:
+                msg_numbers += f"📱 Number: <code>+{n['full']}</code>\n\n"
+            
+            kb = [[rich_btn("⏳ Waiting for OTP...", "primary", "none")]]
+            no_code_btns = []
+            for n in res['numbers']:
+                btn = rich_btn(f"No Code: {n['short']}", style="primary", copy_text=n['short'])
+                no_code_btns.append(btn)
+            
+            if batch_size == 10:
+                for i in range(0, len(no_code_btns), 2):
+                    kb.append(no_code_btns[i:i+2])
+            else:
+                for btn in no_code_btns:
+                    kb.append([btn])
+            
+            kb.append([rich_btn("🔄 Refresh Stock", style="success", callback_data="change_num"), 
+                       rich_btn("🔙 Back", style="danger", callback_data="exit_session")])
+            
+            text = f"<b>{res['header']}</b>\n📋 Click numbers to copy.\n\n{msg_numbers}"
+            await edit_rich_message(context.bot, query.message.chat_id, query.message.message_id, text, kb)
 
-# --- Welcome ---
-def send_welcome(chat_id, user_id, first_name, username):
-    global bot_locked
-    if not check_user_joined(user_id):
-        send_force_join_prompt(chat_id)
-        return
-
-    if bot_locked and user_id not in admin_ids:
-        raw_send(chat_id, f"{PEM['warn']} Bot locked by admin.", reply_keyboard=get_main_kb(user_id))
-        return
-    if user_id not in active_users:
-        add_active_user(user_id)
-        try:
-            bot.send_message(OWNER_ID,
-                f"New user!\n👤 {first_name}\n✳️ @{username or 'N/A'}\n🆔 <code>{user_id}</code>",
-                parse_mode='HTML')
+    elif data == "exit_session":
+        try: await query.message.delete()
         except: pass
-    limit = get_user_file_limit(user_id)
-    curr = get_user_file_count(user_id)
-    lim_str = str(limit) if limit != float('inf') else "Unlimited"
-    exp_info = ""
-    if user_id == OWNER_ID: st = f"{PEM['crown']} Owner"
-    elif user_id in admin_ids: st = f"{PEM['admin']} Admin"
-    elif user_id in user_subscriptions:
-        e = user_subscriptions[user_id].get('expiry')
-        if e and e > datetime.now():
-            st = f"{PEM['check']} Premium"; dl = (e - datetime.now()).days
-            exp_info = f"\n{PEM['wait']} Expires in {dl} days"
-        else: st = f"{PEM['user']} Free (Expired)"; remove_subscription_db(user_id)
-    else: st = f"{PEM['user']} Free User"
-    txt = (f"{PEM['hi']} <b>Welcome, {first_name}!</b>\n\n"
-           f"{PEM['user']} ID: <code>{user_id}</code>\n"
-           f"✳️ Username: @{username or 'Not set'}\n"
-           f"🔰 Status: {st}{exp_info}\n"
-           f"{PEM['file']} Files: {curr} / {lim_str}\n\n"
-           f"{PEM['gear']} Host & run Python (`.py`) or JS (`.js`) scripts.\n"
-           f"{PEM['warn']} All files need <b>Admin Approval</b> before running.\n\n"
-           f"{PEM['pin']} Use buttons below.")
-    raw_send(chat_id, txt, reply_keyboard=get_main_kb(user_id))
+        dash = build_admin_main(uid) if uid in ADMIN_IDS else build_user_main()
+        await context.bot.send_message(chat_id=uid, text="🏁 Dashboard terminal ready.", reply_markup=dash)
 
-# --- Force Join Callback ---
-@bot.callback_query_handler(func=lambda call: call.data == "check_join_status")
-def callback_check_join(call):
-    if check_user_joined(call.from_user.id):
-        bot.answer_callback_query(call.id, "✅ ধন্যবাদ! আপনি সফলভাবে চ্যানেলগুলোতে জয়েন করেছেন।")
-        try: bot.delete_message(call.message.chat.id, call.message.message_id)
-        except: pass
-        send_welcome(call.message.chat.id, call.from_user.id, call.from_user.first_name, call.from_user.username)
-    else:
-        bot.answer_callback_query(call.id, "❌ আপনি এখনো ২টি চ্যানেলে জয়েন করেননি! দয়া করে জয়েন করুন।", show_alert=True)
+    elif data.startswith("adm_del_") and not data.startswith("adm_del_yes_"):
+        if uid not in ADMIN_IDS: return
+        reg = data.replace("adm_del_", "")
+        
+        kb = [
+            [rich_btn("✅ Yes, Delete", style="danger", callback_data=f"adm_del_yes_{reg}")],
+            [rich_btn("❌ Cancel", style="primary", callback_data="exit_session")]
+        ]
+        await edit_rich_message(
+            context.bot, 
+            query.message.chat_id, 
+            query.message.message_id, 
+            f"⚠️ <b>Are you sure?</b>\n\nআপনি কি সত্যিই <b>{reg}</b> এর সমস্ত স্টক এবং অ্যাসাইনমেন্ট মুছে ফেলতে চান?", 
+            kb
+        )
 
-# --- Commands ---
-@bot.message_handler(commands=['start', 'help'])
-def cmd_start(m):
-    send_welcome(m.chat.id, m.from_user.id, m.from_user.first_name, m.from_user.username)
+    elif data.startswith("adm_del_yes_"):
+        if uid not in ADMIN_IDS: return
+        reg = data.replace("adm_del_yes_", "")
+        
+        deleted_count = 0
+        to_del = [b_id for b_id, b_val in CACHE_STOCK.items() if isinstance(b_val, dict) and b_val.get('country') == reg]
+        for batch_id in to_del:
+            cnt = len(CACHE_STOCK[batch_id].get('numbers', []))
+            deleted_count += cnt
+            del CACHE_STOCK[batch_id]
+                
+        to_del_as = [as_key for as_key, as_val in CACHE_ASSIGNMENTS.items() if isinstance(as_val, dict) and as_val.get('country') == reg]
+        for as_key in to_del_as:
+            del CACHE_ASSIGNMENTS[as_key]
 
-@bot.message_handler(commands=['admin'])
-def cmd_admin(m):
-    if m.from_user.id in admin_ids:
-        raw_send(m.chat.id, f"{PEM['admin']} <b>Admin Panel</b>\n{PEM['pin']} Use buttons below.",
-                 reply_keyboard=get_main_kb(m.from_user.id))
-    else:
-        bot.reply_to(m, f"{PEM['no']} Not admin.", parse_mode='HTML')
+        save_local_db()
+        await query.edit_message_text(f"🗑️ <b>Super Fast Deleted!</b>\n\nRegion: {reg}\nDeleted Numbers: {deleted_count}", parse_mode='HTML')
 
-# --- Approve / Reject via text command ---
-@bot.message_handler(func=lambda m: m.text and (m.text.lower().startswith("approve ") or m.text.lower().startswith("reject ")))
-def handle_approval_text(m):
-    uid = m.from_user.id
-    if uid not in admin_ids:
-        bot.reply_to(m, f"{PEM['no']} Admin only.", parse_mode='HTML')
-        return
-    parts = m.text.strip().split()
-    if len(parts) != 2:
-        bot.reply_to(m, f"{PEM['warn']} Use: <code>approve ABCD1234</code> or <code>reject ABCD1234</code>", parse_mode='HTML')
-        return
-    action = parts[0].lower()
-    aid = parts[1].upper()
-    if aid not in pending_approvals:
-        bot.reply_to(m, f"{PEM['no']} Approval ID not found or already handled.", parse_mode='HTML')
-        return
-    ap = pending_approvals[aid]
-    file_uid = ap['user_id']; fn = ap['file_name']; ft = ap['file_type']
-    fp = ap['file_path']; folder = ap['user_folder']; om = ap.get('message_info')
+    elif data.startswith("adm_cc_"):
+        if uid not in ADMIN_IDS: return
+        target_country = data.replace("adm_cc_", "")
+        context.user_data['target_country_cc'] = target_country
+        context.user_data['state'] = 'ADM_SET_CC_VAL'
+        await context.bot.send_message(chat_id=uid, text=f"⚙️ Enter digits to skip for <b>{target_country}</b> 'No Code' numbers:", parse_mode='HTML')
 
-    if action == "approve":
-        del pending_approvals[aid]
+    elif data.startswith("adm_rate_"):
+        if uid not in ADMIN_IDS: return
+        target_country = data.replace("adm_rate_", "")
+        context.user_data['target_country_rate'] = target_country
+        context.user_data['state'] = 'ADM_SET_RATE_VAL'
+        await context.bot.send_message(chat_id=uid, text=f"✍️ Enter custom OTP payout rate for <b>{target_country}</b> (e.g. 2.50):", parse_mode='HTML')
+
+    elif data.startswith("tog_api_"):
+        if uid not in ADMIN_IDS: return
+        api_name = data.replace("tog_api_", "")
+        key = f"api_status_{api_name}"
+        current_status = await get_config_val(key, "1")
+        new_status = "0" if current_status == "1" else "1"
+        await set_config_val(key, new_status)
+        await dispatch_panel_stats_inline(query.message, context, edit=True)
+
+    elif data.startswith("adm_pay_acc_"):
+        if uid not in ADMIN_IDS: return
+        w_id = data.replace("adm_pay_acc_", "")
+        if w_id in CACHE_WITHDRAWALS and isinstance(CACHE_WITHDRAWALS[w_id], dict):
+            CACHE_WITHDRAWALS[w_id]['status'] = 'accepted'
+            save_local_db()
+            await query.edit_message_text(f"✅ Req {w_id} Authorized.")
+
+    elif data.startswith("adm_pay_rej_"):
+        if uid not in ADMIN_IDS: return
+        w_id = data.replace("adm_pay_rej_", "")
+        if w_id in CACHE_WITHDRAWALS and isinstance(CACHE_WITHDRAWALS[w_id], dict):
+            w_data = CACHE_WITHDRAWALS[w_id]
+            req_u_id = str(w_data.get('user_id'))
+            req_amt = float(w_data.get('amount', 0.0))
+            
+            w_data['status'] = 'rejected'
+            if req_u_id in CACHE_USERS and isinstance(CACHE_USERS[req_u_id], dict):
+                curr_bal = float(CACHE_USERS[req_u_id].get('balance', 0.0)) + req_amt
+                CACHE_USERS[req_u_id]['balance'] = curr_bal
+            
+            save_local_db()
+            await query.edit_message_text(f"❌ Withdrawal {w_id} Rejected. Funds restored.")
+
+    elif data.startswith("w_method_"):
+        channel = data.replace("w_method_", "")
+        context.user_data['w_method'] = channel
+        limit = float(await get_config_val('min_withdraw', '1000'))
+        context.user_data['state'] = 'IN_W_AMT'
+        await edit_rich_message(context.bot, query.message.chat_id, query.message.message_id, f"🛒 You selected <b>{channel}</b>.\n💵 <b>Enter payout amount</b> (Minimum: Tk {limit}):", [])
+
+    elif data == "adm_total_paid_show":
+        if uid not in ADMIN_IDS: return
+        limit_date = (datetime.now() - timedelta(days=6)).strftime('%Y-%m-%d %H:%M:%S')
         try:
-            target = om if om else m
-            if ft == 'py':
-                threading.Thread(target=run_script, args=(fp, file_uid, folder, fn, target)).start()
-            elif ft == 'js':
-                threading.Thread(target=run_js_script, args=(fp, file_uid, folder, fn, target)).start()
-            notify_user_approved(file_uid, fn, ft)
-            bot.reply_to(m,
-                f"{PEM['ok']} <b>Approved & Started!</b>\n\n"
-                f"{PEM['user']} User: <code>{file_uid}</code>\n"
-                f"{PEM['file']} File: <code>{fn}</code>",
-                parse_mode='HTML')
+            paid_users = set()
+            total_sum = 0.0
+            
+            for w_id, w_val in CACHE_WITHDRAWALS.items():
+                if isinstance(w_val, dict) and w_val.get('status') == 'accepted' and w_val.get('timestamp', '') >= limit_date:
+                    paid_users.add(w_val.get('user_id'))
+                    total_sum += float(w_val.get('amount', 0.0))
+                    
+            text = f"💵 <b>Total Paid Stats (Last 6 Days)</b>\n\n👥 Total Users Paid: {len(paid_users)}\n💵 Total Paid Amount: Tk {total_sum:.2f}"
+            await edit_rich_message(context.bot, query.message.chat_id, query.message.message_id, text, [[rich_btn("🔙 Back", style="primary", callback_data="exit_session")]])
+        except Exception as e: logger.error(f"Stat failure: {e}")
+
+    elif data == "adm_total_paid_clear":
+        if uid not in ADMIN_IDS: return
+        try:
+            to_del = [w_id for w_id, w_val in CACHE_WITHDRAWALS.items() if isinstance(w_val, dict) and w_val.get('status') == 'accepted']
+            for w_id in to_del:
+                del CACHE_WITHDRAWALS[w_id]
+            save_local_db()
+            await edit_rich_message(context.bot, query.message.chat_id, query.message.message_id, "✅ Payout history successfully cleared.", [[rich_btn("🔙 Back", style="primary", callback_data="exit_session")]])
+        except Exception as e: logger.error(f"Clear failure: {e}")
+
+    elif data.startswith("vstock_"):
+        country = data.replace("vstock_", "")
+        await display_country_stock(update, context, country)
+
+    elif data.startswith("dlstock_"):
+        country = data.replace("dlstock_", "")
+        await download_country_stock_file(update, context, country)
+
+    elif data == "back_stock_hist":
+        await dispatch_stock_history_menu(update, context, edit_message_id=query.message.message_id)
+
+async def router_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text: return
+    raw = msg.text.strip()
+    uid = msg.from_user.id
+    name = msg.from_user.full_name
+    if msg.from_user.username:
+        name = f"@{msg.from_user.username}"
+
+    state = context.user_data.get('state')
+
+    if await check_is_restricted(uid): return
+
+    if raw == "⚡ Get Number 3":
+        context.user_data['p_count'] = 3
+        await dispatch_country_ui(update, context)
+        return
+    elif raw == "🔥 Get Number 10":
+        context.user_data['p_count'] = 10
+        await dispatch_country_ui(update, context)
+        return
+    elif raw == "💳 My Balance":
+        u_val = CACHE_USERS.get(str(uid), {})
+        u_bal = u_val.get('balance', 0.0) if isinstance(u_val, dict) else 0.0
+        await send_rich_message(context.bot, uid, f"💳 <b>Wallet Balance:</b> <code>Tk {float(u_bal):.2f}</code>", [])
+        return
+    elif raw == "🏆 Leaderboard": 
+        await dispatch_leaderboard(update)
+        return
+    elif raw == "📦 Stock History":
+        await dispatch_stock_history_menu(update, context)
+        return
+    elif raw == "💵 Withdraw Funds":
+        kb = [[rich_btn("Bkash", style="primary", callback_data="w_method_Bkash"),
+                rich_btn("Nagad", style="success", callback_data="w_method_Nagad"),
+                rich_btn("Rocket", style="danger", callback_data="w_method_Rocket")]]
+        await send_rich_message(context.bot, uid, "🛒 <b>Select Payout Channel:</b>", kb)
+        return
+
+    if uid in ADMIN_IDS:
+        if raw == "📥 Number Upload":
+            await msg.reply_text("📥 <b>Inventory Hub:</b> Enter region label:"); context.user_data['state'] = 'ADM_UP_C'
+            return
+        elif raw == "🗑️ Number Delete": 
+            await dispatch_wipe_ui(update, context)
+            return 
+        elif raw == "👥 User List":
+            await admin_export_user_db(update, context)
+            return
+        elif raw == "📊 Panel Stats": 
+            await dispatch_panel_stats_inline(msg, context, edit=False)
+            return
+        elif raw == "💸 Withdraw Requests": 
+            await dispatch_payout_ui(update, context)
+            return
+        elif raw == "🧹 Clear All Stocks": 
+            await admin_wipe_all_assignments(update)
+            return
+        elif raw == "💰 Total Paid":
+            kb = [[rich_btn("Total Amount Paid", style="success", callback_data="adm_total_paid_show")],
+                  [rich_btn("Clear Data Total Paid", style="danger", callback_data="adm_total_paid_clear")]]
+            await send_rich_message(context.bot, uid, "💰 <b>Payout Statistics Terminal:</b>", kb)
+            return
+        elif raw == "📢 Broadcast":
+            await msg.reply_text("📢 <b>Enter transmission payload:</b>"); context.user_data['state'] = 'ADM_BROAD'
+            return
+        elif raw == "🚫 Ban User":
+            await msg.reply_text("🚫 <b>Enter target ID to ban:</b>"); context.user_data['state'] = 'ADM_BAN_U'
+            return
+        elif raw == "✅ Unban User":
+            await msg.reply_text("✅ <b>Enter target ID to unban:</b>"); context.user_data['state'] = 'ADM_UNBAN_U'
+            return
+        elif raw == "⚙️ Set CC Limit":
+            await dispatch_cc_limit_ui(update, context)
+            return
+        elif raw == "✍️ Country Rate Set":
+            await dispatch_country_rate_ui(update, context)
+            return
+        elif raw == "📤 Upload User Data" and uid == SUPER_ADMIN_ID:
+            await msg.reply_text("📤 <b>Upload User Data:</b> দয়া করে আপনার আগের ইউজার লিস্টের ফরম্যাটের মতো অথবা JSON ডাটা ব্যাকআপ ফাইলটি এখানে সেন্ড করুন।", parse_mode='HTML')
+            context.user_data['state'] = 'ADM_UP_USER_DB'
+            return
+
+    if state == 'ADM_UP_C':
+        context.user_data['temp_c'], context.user_data['state'] = raw, 'ADM_UP_F'
+        await msg.reply_text(f"🌍 <b>Region set:</b> {raw}.\n📥 Now upload inventory .txt segment.", parse_mode='HTML')
+        return
+    elif state == 'ADM_BROAD':
+        asyncio.create_task(run_background_broadcast(context, raw))
+        await msg.reply_text("📢 <b>Audit Alert:</b> Background broadcast transmission started.")
+        context.user_data['state'] = None
+        return
+    elif state == 'ADM_BAN_U':
+        try:
+            if raw in CACHE_USERS and isinstance(CACHE_USERS[raw], dict):
+                CACHE_USERS[raw]['status'] = 'banned'
+                save_local_db()
+            await msg.reply_text(f"🚫 User {raw} restricted successfully.")
         except Exception as e:
-            logger.error(f"approve err: {e}", exc_info=True)
-            bot.reply_to(m, f"{PEM['no']} Error: {e}", parse_mode='HTML')
-    elif action == "reject":
-        del pending_approvals[aid]
+            await msg.reply_text(f"Failed to ban: {e}")
+        context.user_data['state'] = None
+        return
+    elif state == 'ADM_UNBAN_U':
         try:
-            if os.path.exists(fp): os.remove(fp)
-            remove_user_file_db(file_uid, fn)
-        except Exception as e: logger.error(f"reject del: {e}")
-        notify_user_rejected(file_uid, fn, reason="Admin rejected the file.")
-        bot.reply_to(m,
-            f"{PEM['no']} <b>Rejected & Deleted!</b>\n\n"
-            f"{PEM['user']} User: <code>{file_uid}</code>\n"
-            f"{PEM['file']} File: <code>{fn}</code>",
-            parse_mode='HTML')
-
-# --- Button Text Handler ---
-@bot.message_handler(func=lambda m: m.text in [
-    "Updates Channel", "Upload File", "Check Files",
-    "Bot Speed", "Contact Owner", "Statistics",
-    "Subscriptions", "Broadcast", "Lock Bot",
-    "Running All Code", "Admin Panel", "Run All"
-])
-def handle_btn(m):
-    global bot_locked
-    uid = m.from_user.id
-    if not check_user_joined(uid):
-        send_force_join_prompt(m.chat.id)
+            if raw in CACHE_USERS and isinstance(CACHE_USERS[raw], dict):
+                CACHE_USERS[raw]['status'] = 'active'
+                save_local_db()
+            await msg.reply_text(f"✅ User {raw} restored successfully.")
+        except Exception as e:
+            await msg.reply_text(f"Failed to unban: {e}")
+        context.user_data['state'] = None
+        return
+    elif state == 'ADM_SET_CC_VAL':
+        try:
+            limit_v = int(raw)
+            target_reg = context.user_data.get('target_country_cc')
+            CACHE_LIMITS[target_reg] = limit_v
+            save_local_db()
+            await msg.reply_text(f"⚙️ <b>Audit Result:</b> CC Skip Limit set to {limit_v} digits for {target_reg}.", parse_mode='HTML')
+        except: await msg.reply_text("Numerical input required.")
+        context.user_data['state'] = None
+        return
+    elif state == 'ADM_SET_RATE_VAL':
+        try:
+            rate_v = float(raw)
+            target_reg = context.user_data.get('target_country_rate')
+            CACHE_RATES[target_reg] = rate_v
+            save_local_db()
+            await msg.reply_text(f"✍️ <b>Audit Result:</b> Custom Rate set to Tk {rate_v:.2f} for {target_reg}.", parse_mode='HTML')
+        except: await msg.reply_text("Numerical or float rate required.")
+        context.user_data['state'] = None
         return
 
-    t = m.text
-    if t == "Updates Channel":
-        raw_send(m.chat.id, f"{PEM['msg']} <b>Updates Channel:</b>\n{UPDATE_CHANNEL}",
-                 reply_keyboard=get_main_kb(uid))
-    elif t == "Upload File":
-        limit = get_user_file_limit(uid); curr = get_user_file_count(uid)
-        if curr >= limit:
-            lim_str = str(limit) if limit != float('inf') else "Unlimited"
-            raw_send(m.chat.id, f"{PEM['warn']} Limit ({curr}/{lim_str}).", reply_keyboard=get_main_kb(uid)); return
-        raw_send(m.chat.id,
-                 f"{PEM['file']} Send .py, .js or .zip file.\n{PEM['warn']} Admin approval required.",
-                 reply_keyboard=get_main_kb(uid))
-    elif t == "Check Files":
-        files = user_files.get(uid, [])
-        if not files:
-            raw_send(m.chat.id, f"{PEM['file']} No files.", reply_keyboard=get_main_kb(uid)); return
-        msg = f"{PEM['file']} <b>Your files:</b>\n\n"
+    if state == 'IN_W_AMT':
+        try:
+            amt = float(raw)
+            limit = float(await get_config_val('min_withdraw', '1000'))
+            if amt < limit:
+                await msg.reply_text(f"❌ Amount is below minimum requirement of Tk {limit}.")
+                context.user_data['state'] = None
+                return
+            
+            u_val = CACHE_USERS.get(str(uid), {})
+            bal = float(u_val.get('balance', 0.0)) if isinstance(u_val, dict) else 0.0
+            if bal < amt:
+                await msg.reply_text("❌ Security Error: Insufficient funds.")
+                context.user_data['state'] = None
+                return
+            context.user_data['temp_w_amt'] = amt
+            context.user_data['state'] = 'IN_W_INFO'
+            method = context.user_data.get('w_method', 'Bkash')
+            await msg.reply_text(f"📱 <b>Enter your {method} Account Number:</b>", parse_mode='HTML')
+        except ValueError: 
+            await msg.reply_text("Numerical value required.")
+            context.user_data['state'] = None
+        return
+    elif state == 'IN_W_INFO':
+        amt = context.user_data['temp_w_amt']
+        method = context.user_data.get('w_method', 'Bkash')
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        u_str = str(uid)
+        u_val = CACHE_USERS.get(u_str, {})
+        bal = float(u_val.get('balance', 0.0)) if isinstance(u_val, dict) else 0.0
+        
+        if bal >= amt:
+            new_ref_id = f"w_{int(datetime.now().timestamp())}"
+            w_obj = {
+                'user_id': uid,
+                'user_name': name,
+                'amount': amt,
+                'info': raw,
+                'method': method,
+                'status': 'pending',
+                'timestamp': now_str
+            }
+            CACHE_WITHDRAWALS[new_ref_id] = w_obj
+
+            new_bal = bal - amt
+            if isinstance(CACHE_USERS.get(u_str), dict):
+                CACHE_USERS[u_str]['balance'] = new_bal
+            
+            save_local_db()
+            await msg.reply_text(f"✅ Your withdraw request of Tk {amt:.2f} via {method} has been submitted successfully.")
+        else: 
+            await msg.reply_text("❌ Security Error: Insufficient funds.")
+        context.user_data['state'] = None
+        return
+
+# =========================================================================
+# --- EXPORT USER LIST TO TXT FILE ---
+# =========================================================================
+async def admin_export_user_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not CACHE_USERS:
+            await update.effective_chat.send_message("⚠️ <b>User List Empty:</b> কোনো ইউজার রেজিস্টার্ড হয়নি।", parse_mode='HTML')
+            return
+            
+        stream = StringIO()
+        stream.write("👥 Registered Active User List (Banned Excluded)\n" + "="*50 + "\n\n")
+        
+        user_count = 0
+        for u_id, u_val in CACHE_USERS.items():
+            if isinstance(u_val, dict) and int(u_id) not in ADMIN_IDS:
+                status = u_val.get('status', 'active')
+                if status == 'banned': continue
+                    
+                name = u_val.get('name', 'N/A')
+                balance = float(u_val.get('balance', 0.0))
+                otp_cnt = u_val.get('otp_count', 0)
+                joined = u_val.get('joined_at', 'N/A')
+                
+                stream.write(f"ID: {u_id} | Name: {name} | Balance: Tk {balance:.2f} | OTPs: {otp_cnt} | Status: {status} | Joined: {joined}\n")
+                user_count += 1
+            
+        bio = BytesIO(stream.getvalue().encode('utf-8'))
+        bio.name = f"active_user_list_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=bio, 
+            caption=f"👥 <b>Total Active Users Exported:</b> {user_count} (Banned & Admins Excluded)",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"User list export failed: {e}")
+        await update.effective_chat.send_message(f"❌ <b>Export Error:</b> ইউজার লিস্ট এক্সপোর্ট করতে সমস্যা হয়েছে: {e}", parse_mode='HTML')
+
+# =========================================================================
+# --- INTERACTIVE STOCK HISTORY MANAGERS ---
+# =========================================================================
+async def dispatch_stock_history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message_id=None):
+    uid = update.callback_query.from_user.id if update.callback_query else update.effective_user.id
+    chat_id = update.callback_query.message.chat_id if update.callback_query else update.message.chat_id
+        
+    counts = {}
+    for as_key, as_val in CACHE_ASSIGNMENTS.items():
+        if isinstance(as_val, dict) and as_val.get('user_id') == uid and as_val.get('status') == 'assigned':
+            country = as_val.get('country', 'Global')
+            counts[country] = counts.get(country, 0) + 1
+
+    if not counts:
+        text = "📦 <b>Your Active Stock History:</b>\n\n⚠️ You do not have any active numbers in stock right now."
+        kb = [[rich_btn("🔙 Close Menu", style="danger", callback_data="exit_session")]]
+    else:
+        text = "📦 <b>Your Active Stock History:</b>\n\nSelect a country below to view or export your active stocked numbers:"
         kb = []
-        for fn, ft in sorted(files):
-            r = is_bot_running(uid, fn)
-            icon = "🟢" if r else "🔴"
-            msg += f"{icon} <code>{fn}</code> ({ft})\n"
-            kb.append([rbtn(f"{'Stop' if r else 'Start'} {fn}", "6111726981760423576" if not r else "6311965254817423602",
-                           "danger" if r else "success"),
-                       rbtn(f"Delete {fn}", "6188343249791358585", "danger")])
-        kb.append([rbtn("Back", "6109360506319935223", "primary")])
-        raw_send(m.chat.id, msg, reply_keyboard=kb)
-    elif t == "Bot Speed":
-        t0 = time.time()
-        wm = bot.reply_to(m, f"{PEM['wait']} Testing...", parse_mode='HTML')
-        try:
-            bot.send_chat_action(m.chat.id, 'typing')
-            rt = round((time.time() - t0) * 1000, 2)
-            st = f"{PEM['check']} Unlocked" if not bot_locked else f"{PEM['warn']} Locked"
-            if uid == OWNER_ID: lvl = f"{PEM['crown']} Owner"
-            elif uid in admin_ids: lvl = f"{PEM['admin']} Admin"
-            elif uid in user_subscriptions and user_subscriptions[uid].get('expiry', datetime.min) > datetime.now(): lvl = f"{PEM['check']} Premium"
-            else: lvl = f"{PEM['user']} Free"
-            bot.edit_message_text(f"{PEM['rocket']} Speed: {rt} ms\n🚦 {st}\n👤 {lvl}",
-                                  m.chat.id, wm.message_id, parse_mode='HTML')
+        for country, count in counts.items():
+            kb.append([rich_btn(f"🌍 {country} ({count} numbers)", style="primary", callback_data=f"vstock_{country}")])
+        kb.append([rich_btn("🔙 Close Menu", style="danger", callback_data="exit_session")])
+        
+    if edit_message_id:
+        await edit_rich_message(context.bot, chat_id, edit_message_id, text, kb)
+    else:
+        await send_rich_message(context.bot, uid, text, kb)
+
+async def display_country_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, country: str):
+    query = update.callback_query
+    uid = query.from_user.id
+    
+    numbers_list = []
+    for as_key, as_val in CACHE_ASSIGNMENTS.items():
+        if isinstance(as_val, dict) and as_val.get('user_id') == uid and as_val.get('country') == country and as_val.get('status') == 'assigned':
+            numbers_list.append(as_val.get('number'))
+
+    if not numbers_list:
+        text = f"⚠️ No active stock found for <b>{country}</b>."
+        kb = [[rich_btn("🔙 Back to Stock History", style="danger", callback_data="back_stock_hist")]]
+        await edit_rich_message(context.bot, query.message.chat_id, query.message.message_id, text, kb)
+        return
+        
+    count = len(numbers_list)
+    display_text = f"📦 <b>Active stocked numbers for {country} ({count} nos):</b>\n\n"
+    for num in numbers_list[:30]:
+        clean = normalize_num(num)
+        display_text += f"• <code>+{clean}</code>\n"
+        
+    if count > 30:
+        display_text += f"\n<i>...and {count - 30} more numbers. Click 'Download List' to export all numbers as .txt file!</i>"
+        
+    kb = [
+        [rich_btn("📥 Download .txt List", style="success", callback_data=f"dlstock_{country}")],
+        [rich_btn("🔙 Back to Stock History", style="primary", callback_data="back_stock_hist")]
+    ]
+    await edit_rich_message(context.bot, query.message.chat_id, query.message.message_id, display_text, kb)
+
+async def download_country_stock_file(update: Update, context: ContextTypes.DEFAULT_TYPE, country: str):
+    query = update.callback_query
+    uid = query.from_user.id
+    
+    numbers_list = []
+    for as_key, as_val in CACHE_ASSIGNMENTS.items():
+        if isinstance(as_val, dict) and as_val.get('user_id') == uid and as_val.get('country') == country and as_val.get('status') == 'assigned':
+            numbers_list.append(as_val.get('number'))
+
+    if not numbers_list:
+        try: await query.answer("⚠️ No active stock found to export.", show_alert=True)
         except: pass
-    elif t == "Contact Owner":
-        raw_send(m.chat.id, f"{PEM['msg']} <b>Contact Owner:</b>\nhttps://t.me/{YOUR_USERNAME.replace('@', '')}",
-                 reply_keyboard=get_main_kb(uid))
-    elif t == "Statistics":
-        total_users = len(active_users)
-        total_files = sum(len(f) for f in user_files.values())
-        running = 0; mine = 0
-        for k, v in list(bot_scripts.items()):
-            owner, _ = k.split('_', 1)
-            if is_bot_running(int(owner), v['file_name']):
-                running += 1
-                if int(owner) == uid: mine += 1
-        msg = (f"{PEM['admin']} <b>Statistics:</b>\n\n"
-               f"{PEM['user']} Users: {total_users}\n"
-               f"{PEM['file']} Files: {total_files}\n"
-               f"Running: {running}\n"
-               f"{PEM['wait']} Pending: {len(pending_approvals)}\n")
-        if uid in admin_ids:
-            msg += f"Bot: {'Locked' if bot_locked else 'Unlocked'}\nYour Bots: {mine}"
-        else:
-            msg += f"Your Bots: {mine}"
-        raw_send(m.chat.id, msg, reply_keyboard=get_main_kb(uid))
-    elif t == "Subscriptions":
-        if uid not in admin_ids: raw_send(m.chat.id, f"{PEM['no']} Admin only.", reply_keyboard=get_main_kb(uid)); return
-        raw_send(m.chat.id,
-                 f"{PEM['money']} <b>Subscription Management</b>\n\n"
-                 f"Send: <code>addsub ID DAYS</code>\n"
-                 f"Send: <code>removesub ID</code>\n"
-                 f"Send: <code>checksub ID</code>",
-                 reply_keyboard=get_main_kb(uid))
-    elif t == "Broadcast":
-        if uid not in admin_ids: raw_send(m.chat.id, f"{PEM['no']} Admin only.", reply_keyboard=get_main_kb(uid)); return
-        msg = bot.reply_to(m, f"{PEM['msg']} Send broadcast message.\n/cancel to abort.", parse_mode='HTML')
-        bot.register_next_step_handler(msg, process_broadcast)
-    elif t == "Lock Bot":
-        if uid not in admin_ids: raw_send(m.chat.id, f"{PEM['no']} Admin only.", reply_keyboard=get_main_kb(uid)); return
-        bot_locked = not bot_locked
-        raw_send(m.chat.id, f"{'Bot locked.' if bot_locked else 'Bot unlocked.'}", reply_keyboard=get_main_kb(uid))
-    elif t in ["Running All Code", "Run All"]:
-        if uid not in admin_ids: raw_send(m.chat.id, f"{PEM['no']} Admin only.", reply_keyboard=get_main_kb(uid)); return
-        run_all_scripts(m)
-    elif t == "Admin Panel":
-        if uid not in admin_ids: raw_send(m.chat.id, f"{PEM['no']} Admin only.", reply_keyboard=get_main_kb(uid)); return
-        raw_send(m.chat.id,
-                 f"{PEM['crown']} <b>Admin Panel</b>\n\n"
-                 f"Send: <code>addadmin ID</code>\n"
-                 f"Send: <code>removeadmin ID</code>\n"
-                 f"Send: <code>listadmins</code>",
-                 reply_keyboard=get_main_kb(uid))
-
-# --- File Control via Text Commands ---
-@bot.message_handler(func=lambda m: m.text and (
-    m.text.startswith("Start ") or m.text.startswith("Stop ") or
-    m.text.startswith("Delete ") or m.text.startswith("Logs ")
-))
-def handle_file_cmd(m):
-    global bot_locked
-    uid = m.from_user.id
-    if not check_user_joined(uid):
-        send_force_join_prompt(m.chat.id)
         return
-
-    parts = m.text.split(maxsplit=1)
-    if len(parts) != 2: return
-    action = parts[0].lower()
-    fn = parts[1].strip()
-
-    owner = None
-    for o, files in user_files.items():
-        if any(f[0] == fn for f in files):
-            owner = o
-            break
-    if owner is None:
-        raw_send(m.chat.id, f"{PEM['no']} File not found.", reply_keyboard=get_main_kb(uid)); return
-    if not (uid == owner or uid in admin_ids):
-        raw_send(m.chat.id, f"{PEM['no']} Not yours.", reply_keyboard=get_main_kb(uid)); return
-
-    folder = get_user_folder(owner); fp = os.path.join(folder, fn)
-    ft = next((f[1] for f in user_files.get(owner, []) if f[0] == fn), 'py')
-    key = f"{owner}_{fn}"
-
-    if action == "start":
-        if is_bot_running(owner, fn):
-            raw_send(m.chat.id, f"{PEM['warn']} Already running.", reply_keyboard=get_main_kb(uid)); return
-        if not os.path.exists(fp):
-            raw_send(m.chat.id, f"{PEM['no']} Missing file.", reply_keyboard=get_main_kb(uid))
-            remove_user_file_db(owner, fn); return
-        if ft == 'py':
-            threading.Thread(target=run_script, args=(fp, owner, folder, fn, m)).start()
-        elif ft == 'js':
-            threading.Thread(target=run_js_script, args=(fp, owner, folder, fn, m)).start()
-    elif action == "stop":
-        if not is_bot_running(owner, fn):
-            raw_send(m.chat.id, f"{PEM['warn']} Already stopped.", reply_keyboard=get_main_kb(uid)); return
-        pi = bot_scripts.get(key)
-        if pi: kill_process_tree(pi)
-        bot_scripts.pop(key, None)
-        raw_send(m.chat.id, f"{PEM['ok']} Stopped {fn}.", reply_keyboard=get_main_kb(uid))
-    elif action == "delete":
-        if is_bot_running(owner, fn):
-            pi = bot_scripts.get(key)
-            if pi: kill_process_tree(pi)
-            bot_scripts.pop(key, None)
-        if os.path.exists(fp): os.remove(fp)
-        lp = os.path.join(folder, f"{os.path.splitext(fn)[0]}.log")
-        if os.path.exists(lp): os.remove(lp)
-        remove_user_file_db(owner, fn)
-        raw_send(m.chat.id, f"{PEM['ok']} Deleted {fn}.", reply_keyboard=get_main_kb(uid))
-    elif action == "logs":
-        lp = os.path.join(folder, f"{os.path.splitext(fn)[0]}.log")
-        if not os.path.exists(lp):
-            raw_send(m.chat.id, f"{PEM['no']} No logs.", reply_keyboard=get_main_kb(uid)); return
-        try:
-            content = ""; fs = os.path.getsize(lp)
-            max_kb = 100; max_msg = 3800
-            if fs == 0: content = "(Empty)"
-            elif fs > max_kb * 1024:
-                with open(lp, 'rb') as f:
-                    f.seek(-max_kb * 1024, os.SEEK_END)
-                    content = f.read().decode('utf-8', errors='ignore')
-                content = f"(Last {max_kb} KB)\n...\n" + content
-            else:
-                with open(lp, 'r', encoding='utf-8', errors='ignore') as f: content = f.read()
-            if len(content) > max_msg:
-                content = content[-max_msg:]
-                nl = content.find('\n')
-                if nl != -1: content = "...\n" + content[nl+1:]
-            if not content.strip(): content = "(No content)"
-            raw_send(m.chat.id, f"{PEM['file']} Logs for <b>{fn}</b>:\n<pre>{content}</pre>",
-                     reply_keyboard=get_main_kb(uid))
-        except Exception as e:
-            raw_send(m.chat.id, f"{PEM['no']} Error: {e}", reply_keyboard=get_main_kb(uid))
-
-# --- Text Commands for Admin Panel & Subscriptions ---
-@bot.message_handler(func=lambda m: m.text and (
-    m.text.startswith("addadmin ") or m.text.startswith("removeadmin ") or
-    m.text.lower() == "listadmins" or
-    m.text.startswith("addsub ") or m.text.startswith("removesub ") or
-    m.text.startswith("checksub ")
-))
-def handle_admin_cmd(m):
-    uid = m.from_user.id
-    if uid not in admin_ids:
-        raw_send(m.chat.id, f"{PEM['no']} Admin only.", reply_keyboard=get_main_kb(uid)); return
-    txt = m.text.strip()
-    low = txt.lower()
-
-    if low == "listadmins":
-        lst = "\n".join(f"- <code>{a}</code> {'(Owner)' if a == OWNER_ID else ''}" for a in sorted(admin_ids))
-        if not lst: lst = "(None)"
-        raw_send(m.chat.id, f"{PEM['crown']} <b>Admins:</b>\n\n{lst}", reply_keyboard=get_main_kb(uid))
-        return
-
-    if low.startswith("addadmin "):
-        if uid != OWNER_ID:
-            raw_send(m.chat.id, f"{PEM['no']} Owner only.", reply_keyboard=get_main_kb(uid)); return
-        try:
-            nid = int(txt.split()[1])
-            if nid == OWNER_ID or nid in admin_ids:
-                raw_send(m.chat.id, f"{PEM['warn']} Already admin.", reply_keyboard=get_main_kb(uid)); return
-            add_admin_db(nid)
-            raw_send(m.chat.id, f"{PEM['ok']} Added admin <code>{nid}</code>.", reply_keyboard=get_main_kb(uid))
-            try: bot.send_message(nid, f"{PEM['crown']} You are now Admin!", parse_mode='HTML')
-            except: pass
-        except:
-            raw_send(m.chat.id, f"{PEM['no']} Usage: addadmin ID", reply_keyboard=get_main_kb(uid))
-        return
-
-    if low.startswith("removeadmin "):
-        if uid != OWNER_ID:
-            raw_send(m.chat.id, f"{PEM['no']} Owner only.", reply_keyboard=get_main_kb(uid)); return
-        try:
-            rid = int(txt.split()[1])
-            if remove_admin_db(rid):
-                raw_send(m.chat.id, f"{PEM['ok']} Removed admin <code>{rid}</code>.", reply_keyboard=get_main_kb(uid))
-            else:
-                raw_send(m.chat.id, f"{PEM['warn']} Not admin.", reply_keyboard=get_main_kb(uid))
-        except:
-            raw_send(m.chat.id, f"{PEM['no']} Usage: removeadmin ID", reply_keyboard=get_main_kb(uid))
-        return
-
-    if low.startswith("addsub "):
-        try:
-            parts = txt.split()
-            sid = int(parts[1]); days = int(parts[2])
-            if sid <= 0 or days <= 0: raise ValueError()
-            ce = user_subscriptions.get(sid, {}).get('expiry')
-            start = datetime.now()
-            if ce and ce > start: start = ce
-            ne = start + timedelta(days=days)
-            save_subscription(sid, ne)
-            raw_send(m.chat.id, f"{PEM['ok']} Sub added. Expiry: {ne:%Y-%m-%d}", reply_keyboard=get_main_kb(uid))
-            try: bot.send_message(sid, f"{PEM['gift']} Sub active! Expires: {ne:%Y-%m-%d}.", parse_mode='HTML')
-            except: pass
-        except:
-            raw_send(m.chat.id, f"{PEM['no']} Usage: addsub ID DAYS", reply_keyboard=get_main_kb(uid))
-        return
-
-    if low.startswith("removesub "):
-        try:
-            sid = int(txt.split()[1])
-            remove_subscription_db(sid)
-            raw_send(m.chat.id, f"{PEM['ok']} Sub removed.", reply_keyboard=get_main_kb(uid))
-            try: bot.send_message(sid, f"{PEM['no']} Subscription removed.", parse_mode='HTML')
-            except: pass
-        except:
-            raw_send(m.chat.id, f"{PEM['no']} Usage: removesub ID", reply_keyboard=get_main_kb(uid))
-        return
-
-    if low.startswith("checksub "):
-        try:
-            sid = int(txt.split()[1])
-            if sid in user_subscriptions:
-                e = user_subscriptions[sid].get('expiry')
-                if e:
-                    if e > datetime.now():
-                        dl = (e - datetime.now()).days
-                        raw_send(m.chat.id, f"{PEM['ok']} <code>{sid}</code> active. Expires: {e:%Y-%m-%d} ({dl} days)", reply_keyboard=get_main_kb(uid))
-                    else:
-                        raw_send(m.chat.id, f"{PEM['warn']} <code>{sid}</code> expired.", reply_keyboard=get_main_kb(uid))
-                        remove_subscription_db(sid)
-                else:
-                    raw_send(m.chat.id, f"{PEM['warn']} Expiry missing.", reply_keyboard=get_main_kb(uid))
-            else:
-                raw_send(m.chat.id, f"{PEM['user']} No sub.", reply_keyboard=get_main_kb(uid))
-        except:
-            raw_send(m.chat.id, f"{PEM['no']} Usage: checksub ID", reply_keyboard=get_main_kb(uid))
-        return
-
-# --- Document Handler ---
-@bot.message_handler(content_types=['document'])
-def handle_doc(m):
-    uid = m.from_user.id
-    if not check_user_joined(uid):
-        send_force_join_prompt(m.chat.id)
-        return
-
-    doc = m.document
-    if bot_locked and uid not in admin_ids:
-        raw_send(m.chat.id, f"{PEM['warn']} Bot locked.", reply_keyboard=get_main_kb(uid)); return
-    limit = get_user_file_limit(uid); curr = get_user_file_count(uid)
-    if curr >= limit:
-        lim_str = str(limit) if limit != float('inf') else "Unlimited"
-        raw_send(m.chat.id, f"{PEM['warn']} Limit ({curr}/{lim_str}).", reply_keyboard=get_main_kb(uid)); return
-    fn = doc.file_name
-    if not fn: raw_send(m.chat.id, f"{PEM['no']} No file name.", reply_keyboard=get_main_kb(uid)); return
-    ext = os.path.splitext(fn)[1].lower()
-    if ext not in ['.py', '.js', '.zip']:
-        raw_send(m.chat.id, f"{PEM['no']} Only .py, .js, .zip.", reply_keyboard=get_main_kb(uid)); return
-    if doc.file_size > 20 * 1024 * 1024:
-        raw_send(m.chat.id, f"{PEM['no']} Max 20MB.", reply_keyboard=get_main_kb(uid)); return
+        
+    try: await query.answer("Compiling export stream...")
+    except: pass
+    
+    stream = StringIO()
+    stream.write(f"📦 Active Stock list for country: {country}\n")
+    stream.write(f"Total synced: {len(numbers_list)}\n")
+    stream.write("="*40 + "\n\n")
+    for num in numbers_list:
+        clean = normalize_num(num)
+        stream.write(f"+{clean}\n")
+        
+    bio = BytesIO(stream.getvalue().encode('utf-8'))
+    bio.name = f"{country}_active_stock_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     try:
-        wm = bot.reply_to(m, f"{PEM['wait']} Downloading `{fn}`...", parse_mode='HTML')
-        fi = bot.get_file(doc.file_id)
-        content = bot.download_file(fi.file_path)
-        bot.edit_message_text(f"{PEM['ok']} Downloaded. Processing...", m.chat.id, wm.message_id, parse_mode='HTML')
-        folder = get_user_folder(uid)
-        if ext == '.zip':
-            handle_zip(content, fn, m)
-        else:
-            fp = os.path.join(folder, fn)
-            with open(fp, 'wb') as f: f.write(content)
-            if ext == '.js': handle_js(fp, uid, folder, fn, m)
-            elif ext == '.py': handle_py(fp, uid, folder, fn, m)
-    except telebot.apihelper.ApiTelegramException as e:
-        if "file is too big" in str(e).lower():
-            raw_send(m.chat.id, f"{PEM['no']} File too large.", reply_keyboard=get_main_kb(uid))
-        else:
-            raw_send(m.chat.id, f"{PEM['no']} TG Error: {e}", reply_keyboard=get_main_kb(uid))
+        await context.bot.send_document(chat_id=uid, document=bio, caption=f"📄 Complete list of active numbers for <b>{country}</b> ({len(numbers_list)} numbers).")
     except Exception as e:
-        logger.error(f"doc err: {e}", exc_info=True)
-        raw_send(m.chat.id, f"{PEM['no']} Error: {e}", reply_keyboard=get_main_kb(uid))
+        logger.error(f"Failed to transmit file: {e}")
+        await context.bot.send_message(chat_id=uid, text="❌ Export process failed. Please try again.")
 
-# --- Broadcast ---
-def process_broadcast(m):
-    uid = m.from_user.id
-    if uid not in admin_ids: raw_send(m.chat.id, f"{PEM['no']} Admin only.", reply_keyboard=get_main_kb(uid)); return
-    if m.text and m.text.lower() == '/cancel': raw_send(m.chat.id, "Cancelled.", reply_keyboard=get_main_kb(uid)); return
-    content = m.text
-    if not content and not (m.photo or m.video or m.document or m.sticker):
-        raw_send(m.chat.id, f"{PEM['no']} Empty.", reply_keyboard=get_main_kb(uid)); return
-    raw_send(m.chat.id, f"{PEM['wait']} Broadcasting to {len(active_users)} users...", reply_keyboard=get_main_kb(uid))
-    threading.Thread(target=do_broadcast, args=(content, m.chat.id)).start()
+# =========================================================================
+# --- ADMINISTRATIVE CONTROL DISPATCHERS ---
+# =========================================================================
+async def run_background_broadcast(context, payload):
+    for u_id in list(CACHE_USERS.keys()):
+        try: 
+            await send_rich_message(context.bot, int(u_id), f'📢 <b>Official Notice:</b>\n\n{payload}', [])
+            await asyncio.sleep(0.035) 
+        except: pass
 
-def do_broadcast(text, chat_id):
-    sent = 0; failed = 0; blocked = 0
-    users = list(active_users); total = len(users)
-    for i, u in enumerate(users):
+async def dispatch_panel_stats_inline(message, context, edit=False):
+    text = "📊 <b>Panel Control Stats</b>\n\nনিচের বাটনগুলো ক্লিক করে যেকোনো এপিআই সোর্স চালু বা বন্ধ করতে পারবেন।"
+    kb = []
+    for src in API_SOURCES:
+        status_val = await get_config_val(f"api_status_{src['name']}", "1")
+        indicator = "🟢 ON" if status_val == "1" else "🔴 OFF"
+        kb.append([rich_btn(f"{src['name']} Panel | {indicator}", "primary", f"tog_api_{src['name']}")])
+    kb.append([rich_btn("🔙 Close Menu", "danger", "exit_session")])
+    
+    if edit:
+        await edit_rich_message(context.bot, message.chat_id, message.message_id, text, kb)
+    else:
+        await send_rich_message(context.bot, message.chat_id, text, kb)
+
+async def dispatch_country_ui(update, context):
+    counts = {}
+    for b_id, b_val in CACHE_STOCK.items():
+        if isinstance(b_val, dict) and b_val.get('country'):
+            c = b_val.get('country')
+            cnt = len(b_val.get('numbers', []))
+            if cnt > 0:
+                counts[c] = counts.get(c, 0) + cnt
+
+    if counts:
+        btns = [[rich_btn(f"🌍 Region: {c} ({cnt})", "primary", f"alloc_{c}")] for c, cnt in counts.items()]
+        await send_rich_message(context.bot, update.message.chat_id, "🌍 <b>Select Region Terminal:</b>", btns, parse_mode='HTML')
+    else: 
+        await update.message.reply_text("⚠️ Inventory empty.")
+
+async def dispatch_payout_ui(update, context):
+    pending_found = False
+    for w_id, w_val in CACHE_WITHDRAWALS.items():
+        if isinstance(w_val, dict) and w_val.get('status') == 'pending':
+            pending_found = True
+            u_id = w_val.get('user_id')
+            
+            u_info = CACHE_USERS.get(str(u_id), {})
+            u_name = w_val.get('user_name') or (u_info.get('name') if isinstance(u_info, dict) else None) or "Unknown User"
+            
+            kb = [
+                [rich_btn("Copy Payment Details", "primary", copy_text=str(w_val.get('info')))],
+                [rich_btn("Authorize", "success", f"adm_pay_acc_{w_id}"), 
+                 rich_btn("Reject", "danger", f"adm_pay_rej_{w_id}")]
+            ]
+            
+            msg_text = (
+                f"💸 <b>Withdraw Request</b>\n"
+                f"🆔 Req ID: <code>{w_id}</code>\n"
+                f"👤 Name: <b>{html.escape(u_name)}</b>\n"
+                f"🔢 UID: <code>{u_id}</code>\n"
+                f"🛒 Method: {w_val.get('method')}\n"
+                f"💵 Amount: Tk {w_val.get('amount')}\n"
+                f"📱 Acc: <code>{w_val.get('info')}</code>"
+            )
+            await send_rich_message(context.bot, update.message.chat_id, msg_text, kb, parse_mode='HTML')
+            
+    if not pending_found:
+        await update.message.reply_text("🏁 Withdraw queue empty.")
+
+async def dispatch_wipe_ui(update, context):
+    countries = set(b_val.get('country') for b_val in CACHE_STOCK.values() if isinstance(b_val, dict) and b_val.get('country'))
+    if countries:
+        btns = [[rich_btn(f"Purge: {c} Stock", "danger", f"adm_del_{c}")] for c in countries]
+        await send_rich_message(context.bot, update.message.chat_id, "🚨 <b>Danger Zone: Purge stock level:</b>", btns, parse_mode='HTML')
+    else: await update.message.reply_text("⚠️ Inventory table empty.")
+
+async def dispatch_cc_limit_ui(update, context):
+    countries = set(b_val.get('country') for b_val in CACHE_STOCK.values() if isinstance(b_val, dict) and b_val.get('country'))
+    if countries:
+        btns = [[rich_btn(f"⚙️ CC Limit: {c}", "primary", f"adm_cc_{c}")] for c in countries]
+        await send_rich_message(context.bot, update.message.chat_id, "⚙️ <b>Select Country to set CC limit:</b>", btns, parse_mode='HTML')
+    else: await update.message.reply_text("⚠️ No uploaded numbers found.")
+
+async def dispatch_country_rate_ui(update, context):
+    countries = set(b_val.get('country') for b_val in CACHE_STOCK.values() if isinstance(b_val, dict) and b_val.get('country'))
+    if countries:
+        btns = [[rich_btn(f"✍️ Rate: {c}", "primary", f"adm_rate_{c}")] for c in countries]
+        await send_rich_message(context.bot, update.message.chat_id, "✍️ <b>Select Country to set custom payout rate:</b>", btns, parse_mode='HTML')
+    else: await update.message.reply_text("⚠️ No stocked countries found.")
+
+async def admin_wipe_all_assignments(update):
+    CACHE_STOCK.clear()
+    CACHE_ASSIGNMENTS.clear()
+    save_local_db()
+
+    await update.message.reply_text("🧹 <b>Audit Reset:</b> All stocks and user assignments cleared successfully!", parse_mode='HTML')
+
+async def dispatch_leaderboard(update):
+    midnight_str = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
+    
+    scores = []
+    for u_id, p_msgs in CACHE_PROCESSED.items():
+        if isinstance(p_msgs, dict):
+            count = 0
+            for m_hash, m_data in p_msgs.items():
+                if isinstance(m_data, dict) and m_data.get('timestamp', '') >= midnight_str:
+                    count += 1
+            if count > 0:
+                u_val = CACHE_USERS.get(str(u_id), {})
+                u_name = u_val.get('name', 'User') if isinstance(u_val, dict) else 'User'
+                scores.append((u_name, count))
+            
+    scores.sort(key=lambda x: x[1], reverse=True)
+    
+    if scores:
+        out = f"🏆 <b>Daily Ranking (Since 12 AM Today):</b>\n\n"
+        for i, (name, score) in enumerate(scores[:10], 1):
+            cl_name = name[:-3] if len(name) > 3 else "User"
+            out += f"{i}. {cl_name}... - OTP Success: {score}\n"
+        await update.message.reply_text(out, parse_mode='HTML')
+    else: 
+        await update.message.reply_text("⏱️ Terminal Data: No activity yet.")
+
+async def check_is_restricted(uid):
+    u_val = CACHE_USERS.get(str(uid), {})
+    status = u_val.get('status') if isinstance(u_val, dict) else None
+    return status == 'banned'
+
+# =========================================================================
+# --- FILE UPLOADS (SUPPORTING BOTH .TXT USER LIST AND .JSON BACKUP) ---
+# =========================================================================
+async def handler_file_up(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS: return
+    state = context.user_data.get('state')
+    
+    if state == 'ADM_UP_USER_DB' and uid == SUPER_ADMIN_ID:
         try:
-            bot.send_message(u, f"{PEM['bell']} {text}", parse_mode='HTML')
-            sent += 1
-        except telebot.apihelper.ApiTelegramException as e:
-            ed = str(e).lower()
-            if any(s in ed for s in ["blocked", "deactivated", "chat not found", "kicked", "restricted"]):
-                blocked += 1
-            else: failed += 1
-        except: failed += 1
-        if (i + 1) % 25 == 0: time.sleep(1.5)
-        elif i % 5 == 0: time.sleep(0.2)
-    raw_send(chat_id, f"{PEM['ok']} <b>Broadcast Complete!</b>\n\n✅ Sent: {sent}\n❌ Failed: {failed}\n🚫 Blocked: {blocked}\n👥 Total: {total}")
+            doc = await update.message.document.get_file()
+            path = f"tmp_user_db_{uid}.txt"
+            await doc.download_to_drive(path)
+            
+            with open(path, "r", encoding='utf-8') as f:
+                content = f.read()
+                
+            if "ID:" in content and "Balance:" in content:
+                global CACHE_USERS
+                lines = content.splitlines()
+                imported_count = 0
+                for line in lines:
+                    if "ID:" in line and "Balance:" in line:
+                        try:
+                            parts = line.split("|")
+                            u_id_str = parts[0].replace("ID:", "").strip()
+                            name_str = parts[1].replace("Name:", "").strip()
+                            bal_str = parts[2].replace("Balance: Tk", "").strip()
+                            otp_str = parts[3].replace("OTPs:", "").strip()
+                            status_str = parts[4].replace("Status:", "").strip()
+                            joined_str = parts[5].replace("Joined:", "").strip()
+                            
+                            CACHE_USERS[u_id_str] = {
+                                "name": name_str,
+                                "balance": float(bal_str),
+                                "otp_count": int(otp_str),
+                                "status": status_str,
+                                "joined_at": joined_str
+                            }
+                            imported_count += 1
+                        except Exception:
+                            continue
+                save_local_db()
+                await update.message.reply_text(f"✅ <b>Successfully Parsed & Imported {imported_count} Users from Text List!</b>", parse_mode='HTML')
+            else:
+                try:
+                    uploaded_data = json.loads(content)
+                    if isinstance(uploaded_data, dict) and "users" in uploaded_data:
+                        global CACHE_ASSIGNMENTS, CACHE_WITHDRAWALS
+                        CACHE_USERS = uploaded_data.get("users", CACHE_USERS)
+                        if "assignments" in uploaded_data:
+                            CACHE_ASSIGNMENTS = uploaded_data.get("assignments", CACHE_ASSIGNMENTS)
+                        if "withdrawals" in uploaded_data:
+                            CACHE_WITHDRAWALS = uploaded_data.get("withdrawals", CACHE_WITHDRAWALS)
+                        save_local_db()
+                        await update.message.reply_text("✅ <b>User Database JSON Successfully Synced!</b>", parse_mode='HTML')
+                    else:
+                        await update.message.reply_text("❌ <b>Error:</b> সঠিক ফরম্যাটের ফাইল দিন।", parse_mode='HTML')
+                except Exception:
+                    await update.message.reply_text("❌ <b>Error:</b> ফাইল পার্স করতে সমস্যা হয়েছে।", parse_mode='HTML')
+        except Exception as e:
+            await update.message.reply_text(f"❌ Upload Error: {e}")
+        finally:
+            if 'path' in locals() and os.path.exists(path): 
+                os.remove(path)
+            context.user_data['state'] = None
+            return
 
-# --- Run All Scripts ---
-def run_all_scripts(m):
-    uid = m.from_user.id; chat_id = m.chat.id
-    if uid not in admin_ids: return
-    raw_send(chat_id, f"{PEM['wait']} Starting all scripts...", reply_keyboard=get_main_kb(uid))
-    threading.Thread(target=run_all_scripts_bg, args=(chat_id,)).start()
+    if state != 'ADM_UP_F': return
+    
+    try:
+        reg = context.user_data.get('temp_c', 'Unknown')
+        doc = await update.message.document.get_file()
+        path = f"tmp_sync_{uid}.txt"
+        await doc.download_to_drive(path)
+        
+        with open(path, "r", encoding='utf-8') as f:
+            raw_numbers = [line.strip() for line in f if line.strip()]
 
-def run_all_scripts_bg(chat_id):
-    started = 0; users_count = 0; skipped = 0
-    snapshot = dict(user_files)
-    for tuid, files in snapshot.items():
-        if not files: continue
-        users_count += 1
-        uf = get_user_folder(tuid)
-        for fn, ft in files:
-            if not is_bot_running(tuid, fn):
-                fp = os.path.join(uf, fn)
-                if os.path.exists(fp):
-                    try:
-                        if ft == 'py':
-                            threading.Thread(target=run_script, args=(fp, tuid, uf, fn, _FakeMsg(chat_id))).start()
-                        elif ft == 'js':
-                            threading.Thread(target=run_js_script, args=(fp, tuid, uf, fn, _FakeMsg(chat_id))).start()
-                        started += 1
-                        time.sleep(0.7)
-                    except: skipped += 1
-                else:
-                    skipped += 1
-    msg = f"{PEM['ok']} Started: {started}\n👥 Users: {users_count}\n"
-    if skipped: msg += f"{PEM['warn']} Skipped: {skipped}\n"
-    raw_send(chat_id, msg)
+        if not raw_numbers:
+            await update.message.reply_text("⚠️ File is empty!")
+            return
 
-class _FakeMsg:
-    def __init__(self, chat_id):
-        self.chat = type('C', (), {'id': chat_id})()
+        batch_id = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uid)[:4]}"
+        
+        batch_data = {
+            "country": reg,
+            "numbers": raw_numbers,
+            "uploaded_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
 
-# --- Cleanup ---
-def cleanup():
-    logger.warning("Shutting down...")
-    for k in list(bot_scripts.keys()):
-        if k in bot_scripts: kill_process_tree(bot_scripts[k])
-atexit.register(cleanup)
+        CACHE_STOCK[batch_id] = batch_data
 
-# --- Main ---
-if __name__ == '__main__':
-    logger.info("=" * 40 + f"\n🤖 Bot Starting...\n🔑 Owner: {OWNER_ID}\n🛡️ Admins: {admin_ids}\n" + "=" * 40)
-    keep_alive()
-    logger.info("🚀 Polling started...")
+        await update.message.reply_text(
+            f"⚡ <b>1-Second Instant Upload Success (RAM Only)!</b>\n"
+            f"📥 <b>Region:</b> {reg}\n"
+            f"🔢 <b>Total Numbers:</b> <code>{len(raw_numbers)}</code>\n"
+            f"🆔 <b>Batch ID:</b> <code>{batch_id}</code>", 
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Instant Upload Error: {e}")
+        await update.message.reply_text(f"❌ Upload Error: {e}")
+    finally:
+        if 'path' in locals() and os.path.exists(path): 
+            os.remove(path)
+        context.user_data['state'] = None
+
+# =========================================================================
+# --- LIFECYCLE MANAGEMENT ---
+# =========================================================================
+async def poll_single_source(application, api):
+    logger.info(f"High-Speed Engine: Polling thread started for {api['name']}")
     while True:
         try:
-            bot.infinity_polling(logger_level=logging.INFO, timeout=60, long_polling_timeout=30)
-        except requests.exceptions.ReadTimeout:
-            logger.warning("ReadTimeout. 5s..."); time.sleep(5)
-        except requests.exceptions.ConnectionError as ce:
-            logger.error(f"ConnError: {ce}. 15s..."); time.sleep(15)
+            status_val = await get_config_val(f"api_status_{api['name']}", "1")
+            if status_val == "0":
+                await asyncio.sleep(4.0)
+                continue
+                
+            res = await http_client.get(api["url"], params={"token": api["token"], "limit": 30})
+            if res.status_code == 200:
+                resp_json = res.json()
+                data = resp_json.get("records", resp_json.get("data", [])) if isinstance(resp_json, dict) else resp_json
+                if not isinstance(data, list): data = [data]
+                
+                for item in data:
+                    if isinstance(item, list) and len(item) >= 3:
+                        item = {'cli': item[0], 'num': item[1], 'message': item[2]}
+                    if not isinstance(item, dict): continue
+                    
+                    r_num = str(item.get('num', item.get('number', '')))
+                    r_msg = item.get('message', item.get('content', ''))
+                    
+                    uid_hash = hashlib.md5(f"{r_num}_{r_msg}".encode()).hexdigest()
+                    if uid_hash not in processed_ids:
+                        await engine_process_signal(application, item, silent=False)
+                        processed_ids.add(uid_hash)
+                        if len(processed_ids) > 100000: processed_ids.clear()
         except Exception as e:
-            logger.critical(f"💥 Polling error: {e}", exc_info=True); time.sleep(30)
-        finally:
-            time.sleep(1)
+            logger.debug(f"Source {api['name']} Connection Skip: {e}")
+        await asyncio.sleep(1.5)
+
+async def startup_sync(application):
+    for api in API_SOURCES:
+        try:
+            status_val = await get_config_val(f"api_status_{api['name']}", "1")
+            if status_val == "0": continue
+            
+            res = await http_client.get(api["url"], params={"token": api["token"], "limit": 5})
+            if res.status_code == 200:
+                resp_json = res.json()
+                data = resp_json.get("records", resp_json.get("data", [])) if isinstance(resp_json, dict) else resp_json
+                if not isinstance(data, list): data = [data]
+                for item in reversed(data):
+                    if isinstance(item, list) and len(item) >= 3:
+                        item = {'cli': item[0], 'num': item[1], 'message': item[2]}
+                    if not isinstance(item, dict): continue
+                    
+                    r_num = str(item.get('num', item.get('number', '')))
+                    r_msg = item.get('message', item.get('content', ''))
+                    
+                    uid_hash = hashlib.md5(f"{r_num}_{r_msg}".encode()).hexdigest()
+                    if uid_hash not in processed_ids:
+                        await engine_process_signal(application, item, silent=True)
+                        processed_ids.add(uid_hash)
+        except Exception: pass
+
+async def app_post_init(app):
+    await startup_sync(app)
+    for api in API_SOURCES:
+        asyncio.create_task(poll_single_source(app, api))
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception occurred during live update cycle:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ <b>System Notification:</b> An unexpected request error was logged. Please request again.",
+                parse_mode='HTML'
+            )
+        except Exception: pass
+
+if __name__ == '__main__':
+    try:
+        instance = ApplicationBuilder().token(TOKEN).post_init(app_post_init).build()
+        instance.add_handler(CommandHandler("start", handle_start))
+        instance.add_handler(CallbackQueryHandler(router_callbacks))
+        instance.add_handler(MessageHandler(filters.Document.ALL, handler_file_up))
+        instance.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), router_text))
+        instance.add_error_handler(error_handler)
+        
+        logger.info("Terminal tactical build stabilized with Local JSON Storage & Super Fast Speed.")
+        instance.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        logger.critical(f"Panic Shutdown: {e}")
