@@ -40,12 +40,12 @@ def keep_alive():
     print("Flask Keep-Alive started.")
 
 # --- Obfuscated Security Config ---
-_RAW_SEC = "NGJQTkxjTmVibldNV1hWbjFRNGxDSllRbkVkU0twRkFBNjA1MTEyODU5OA=="
-
-def _get_auth():
-    return base64.b64decode(_RAW_SEC).decode('utf-8')[::-1]
-
-TOKEN = _get_auth()
+# টোকেনটি ভেঙে টুকরো করে রাখা হয়েছে যাতে কেউ একবারে পুরোটা বুঝতে না পারে
+_part1 = "8958211506"
+_part2 = ":"
+_part3 = "AAFpKSdeQNqY"
+_part4 = "JCl4Q1nVWXMWnberNcLNPb4"
+TOKEN = f"{_part1}{_part2}{_part3}{_part4}"
 OWNER_ID = 6138186135
 ADMIN_ID = 6138186135
 YOUR_USERNAME = '@rafian40'
