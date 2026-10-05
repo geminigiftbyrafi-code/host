@@ -18,7 +18,6 @@ import uuid
 import atexit
 import requests
 import io
-import base64
 
 # --- Flask Keep Alive ---
 from flask import Flask
@@ -39,15 +38,16 @@ def keep_alive():
     t.start()
     print("Flask Keep-Alive started.")
 
-# --- Obfuscated Security Config ---
-# টোকেনটি ভেঙে টুকরো করে রাখা হয়েছে যাতে কেউ একবারে পুরোটা বুঝতে না পারে
-_part1 = "8958211506"
-_part2 = ":"
-_part3 = "AAFpKSdeQNqY"
-_part4 = "JCl4Q1nVWXMWnberNcLNPb4"
-TOKEN = f"{_part1}{_part2}{_part3}{_part4}"
+
+_p1 = "8958211506"
+_p2 = ":"
+_p3 = "AAFpKSdeQNqY"
+_p4 = "JCl4Q1nVWXMWnberNcLNPb4"
+TOKEN = f"{_p1}{_p2}{_p3}{_p4}"
+
 OWNER_ID = 6138186135
 ADMIN_ID = 6138186135
+
 YOUR_USERNAME = '@rafian40'
 UPDATE_CHANNEL = 'https://t.me/rafian40'
 
